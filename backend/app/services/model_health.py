@@ -10,7 +10,7 @@ async def models_health(settings: Settings | None = None) -> dict:
     return {
         "ollama": ollama,
         "openai": _cloud_health(settings.openai_api_key, settings.openai_default_model),
-        "gemini": _cloud_health(settings.gemini_api_key, settings.gemini_default_model),
+        "gemini": _cloud_health(settings.gemini_api_key, settings.resolved_gemini_default_model),
         "deepseek": _cloud_health(settings.deepseek_api_key, settings.deepseek_default_model),
         "embedding": embedding_status(),
     }

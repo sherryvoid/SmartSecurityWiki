@@ -1,5 +1,8 @@
+# READ SUMMARY: This module owns ChromaDB indexing/querying and embedding provider selection for code and wiki chunks.
+# CHANGED: Added generic retrieval re-scoring metadata so code evidence outranks prose without re-indexing projects.
 import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Literal
@@ -7,7 +10,8 @@ from typing import Iterable, Literal
 from app.core.config import get_settings
 
 
-logger = logging.getLogger(__name__)
+_logger = logging.getLogger(__name__)
+logger = _logger
 HASH_DIMENSIONS = 128
 _embedding_provider: "BaseEmbeddingProvider | None" = None
 _embedding_warning: str | None = None
@@ -43,7 +47,7 @@ class SentenceTransformerEmbeddingProvider(BaseEmbeddingProvider):
         self.model = model_name
         from sentence_transformers import SentenceTransformer
 
-        self._model = SentenceTransformer(model_name)
+        self._model = SentenceTransformer(model_name, local_files_only=True)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
@@ -56,6 +60,8 @@ class VectorHit:
     id: str
     metadata: dict
     document: str
+    distance: float | None = None
+    score: float | None = None
 
 
 def active_embedding_provider() -> BaseEmbeddingProvider:
@@ -92,6 +98,12 @@ def embedding_status() -> dict:
         "warning": _embedding_warning,
         "label": provider.label,
     }
+
+
+def get_embedding_mode() -> str:
+    """Returns 'semantic' or 'hash-fallback' depending on what is active."""
+    provider = active_embedding_provider()
+    return "semantic" if provider.name == "sentence-transformers" else "hash-fallback"
 
 
 def hash_embedding(text: str) -> list[float]:
@@ -153,6 +165,8 @@ def index_code_chunk(chunk: dict) -> str | None:
                     "end_line": chunk["end_line"],
                     "language": chunk.get("language") or "",
                     "security_tags": chunk.get("security_tags") or "",
+                    "tags": chunk.get("security_tags") or "",
+                    "chunk_type": chunk.get("chunk_type") or "",
                 }
             ],
         )
@@ -259,15 +273,151 @@ def query(
         ids = result.get("ids", [[]])[0]
         metadatas = result.get("metadatas", [[]])[0]
         documents = result.get("documents", [[]])[0]
+        distances = result.get("distances", [[]])[0] if result.get("distances") else []
         hits: list[VectorHit] = []
-        for hit_id, metadata, document in zip(ids, metadatas, documents):
+        for index, (hit_id, metadata, document) in enumerate(zip(ids, metadatas, documents)):
             if not metadata:
                 continue
-            hits.append(VectorHit(source_type=metadata.get("source_type", ""), id=hit_id, metadata=metadata, document=document or ""))
+            distance = distances[index] if index < len(distances) else None
+            hits.append(VectorHit(source_type=metadata.get("source_type", ""), id=hit_id, metadata=metadata, document=document or "", distance=distance))
         return hits
     except Exception as exc:
         logger.warning("Vector query failed for project %s: %s", project_id, exc)
         return []
+
+
+FILE_EXTENSION_WEIGHTS = {
+    ".java": 1.3,
+    ".kt": 1.3,
+    ".go": 1.3,
+    ".py": 1.3,
+    ".rb": 1.3,
+    ".php": 1.3,
+    ".rs": 1.3,
+    ".cs": 1.3,
+    ".swift": 1.3,
+    ".ts": 1.2,
+    ".js": 1.2,
+    ".jsx": 1.2,
+    ".tsx": 1.2,
+    ".c": 1.2,
+    ".cpp": 1.2,
+    ".cc": 1.2,
+    ".cxx": 1.2,
+    ".aidl": 1.2,
+    ".te": 1.2,
+    ".proto": 1.2,
+    ".h": 1.1,
+    ".hpp": 1.1,
+    ".xml": 1.1,
+    ".yaml": 1.1,
+    ".yml": 1.1,
+    ".json": 1.1,
+    ".conf": 1.1,
+    ".toml": 1.0,
+    ".ini": 1.0,
+    ".env": 1.0,
+    ".md": 0.7,
+    ".txt": 0.7,
+    ".rst": 0.7,
+    ".html": 0.8,
+    ".css": 0.8,
+}
+
+CHUNK_TYPE_WEIGHTS = {
+    "method": 1.2,
+    "function": 1.2,
+    "async_function": 1.2,
+    "route_handler": 1.2,
+    "class": 1.1,
+    "decorator_class": 1.1,
+    "arrow_function": 1.1,
+    "interface": 1.1,
+    "constructor": 1.1,
+    "markdown_section": 0.6,
+    "line_range_fallback": 0.8,
+    "file_summary": 0.7,
+}
+
+SECURITY_BOOST_TERMS = {
+    "permission",
+    "auth",
+    "access",
+    "security",
+    "role",
+    "policy",
+    "binder",
+    "selinux",
+    "rbac",
+    "jwt",
+    "token",
+    "credential",
+    "checkpermission",
+    "enforcepermission",
+    "preauthorize",
+    "requestmapping",
+    "webmvctest",
+    "filter",
+    "interceptor",
+}
+
+
+def rescore_chunks(chunks: list) -> list:
+    """Apply generic source/chunk/security weighting after Chroma returns candidates."""
+    rescored = []
+    for chunk in chunks:
+        item = dict(chunk)
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        base_similarity = _base_similarity(item)
+        file_path = item.get("file_path") or metadata.get("file_path") or ""
+        chunk_type = item.get("chunk_type") or metadata.get("chunk_type") or ""
+        tags = item.get("tags", item.get("security_tags", metadata.get("tags", metadata.get("security_tags", []))))
+        file_weight = FILE_EXTENSION_WEIGHTS.get(os.path.splitext(str(file_path))[1].lower(), 1.0) if file_path else 1.0
+        chunk_type_weight = CHUNK_TYPE_WEIGHTS.get(str(chunk_type), 1.0) if chunk_type else 1.0
+        security_boost = 0.15 if _has_security_boost_tag(tags) else 0.0
+        final_score = (base_similarity * file_weight * chunk_type_weight) + security_boost
+        item["base_similarity"] = base_similarity
+        item["final_score"] = final_score
+        item["file_weight"] = file_weight
+        item["chunk_type_weight"] = chunk_type_weight
+        item["security_boost"] = security_boost
+        rescored.append(item)
+    return sorted(rescored, key=lambda chunk: chunk.get("final_score", 0.0), reverse=True)
+
+
+def _base_similarity(chunk: dict) -> float:
+    if chunk.get("base_similarity") is not None:
+        return _clamp(float(chunk.get("base_similarity") or 0.0))
+    if chunk.get("score") is not None:
+        return _clamp(float(chunk.get("score") or 0.0))
+    if chunk.get("distance") is not None:
+        return _clamp(1.0 - float(chunk.get("distance") or 0.0))
+    return 1.0
+
+
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _has_security_boost_tag(tags) -> bool:
+    if tags is None:
+        return False
+    if isinstance(tags, str):
+        tag_values = [tag.strip() for tag in tags.replace(";", ",").split(",")]
+    elif isinstance(tags, list):
+        tag_values = [str(tag) for tag in tags]
+    else:
+        tag_values = [str(tags)]
+    return any(term in tag.lower() for tag in tag_values for term in SECURITY_BOOST_TERMS)
+
+
+def code_chunk_exists(project_id: str, chunk_id: str) -> bool:
+    try:
+        result = _collection(project_id).get(ids=[f"code:{chunk_id}"], limit=1)
+        return bool(result.get("ids"))
+    except Exception as exc:
+        logger.warning("Vector lookup failed for code chunk %s in project %s: %s", chunk_id, project_id, exc)
+        return False
 
 
 def _client():

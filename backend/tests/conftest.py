@@ -1,4 +1,8 @@
+# READ SUMMARY: This conftest prepares backend import paths and isolated environment fixtures for pytest.
+# CHANGED: Added a Windows-safe tmp_path fixture that avoids locked pytest-managed temp roots.
+import shutil
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -7,6 +11,18 @@ import pytest
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
+
+
+@pytest.fixture()
+def tmp_path():
+    root = BACKEND_ROOT / "manual-test-runtime"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / str(uuid.uuid4())
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture()
@@ -27,3 +43,11 @@ def isolated_env(tmp_path, monkeypatch):
     yield tmp_path
     get_settings.cache_clear()
     vector_index._embedding_provider = None
+
+
+@pytest.fixture
+def ephemeral_chroma():
+    import chromadb
+
+    client = chromadb.Client()
+    yield client

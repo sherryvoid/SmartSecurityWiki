@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import auth, health, models, projects
 from app.core.config import get_settings
 from app.db.database import init_db
+from app.services.vector_index import get_embedding_mode
 
 
 settings = get_settings()
@@ -15,6 +16,7 @@ logging.getLogger(__name__).info(
     settings.embedding_provider,
     settings.embedding_model,
 )
+logging.getLogger(__name__).info("[VectorIndex] Embedding mode: %s", get_embedding_mode())
 init_db()
 
 app = FastAPI(title="Security CodeWiki", version="0.1.0")

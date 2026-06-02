@@ -1,3 +1,5 @@
+# READ SUMMARY: This test module verifies the current backend pipeline from DB setup through indexing, chat, wiki, feedback, and imports.
+# CHANGED: Updated the comparison mock to target the new shared retrieval-package function.
 import asyncio
 import json
 import sqlite3
@@ -88,6 +90,91 @@ throw new SecurityException("denied");
 
     assert tags
     assert "potential_access_check" in tags
+
+
+def test_file_filtering_includes_python_and_javascript_and_ignores_dependency_dirs(tmp_path):
+    from app.services.files import is_relevant_file, language_for_path
+
+    python_file = tmp_path / "app.py"
+    python_file.write_text("def read_user(): pass")
+    ts_file = tmp_path / "auth.ts"
+    ts_file.write_text("export const requireRole = () => true")
+    venv_file = tmp_path / "venv" / "lib" / "site.py"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("ignored")
+    node_file = tmp_path / "node_modules" / "pkg" / "index.js"
+    node_file.parent.mkdir(parents=True)
+    node_file.write_text("ignored")
+    next_file = tmp_path / ".next" / "server.js"
+    next_file.parent.mkdir()
+    next_file.write_text("ignored")
+
+    assert is_relevant_file(python_file)
+    assert is_relevant_file(ts_file)
+    assert language_for_path("app.py") == "python"
+    assert language_for_path("auth.ts") == "typescript"
+    assert not is_relevant_file(venv_file)
+    assert not is_relevant_file(node_file)
+    assert not is_relevant_file(next_file)
+
+
+def test_parser_creates_python_function_async_function_and_class_chunks():
+    from app.services.parser import chunk_source
+
+    code = """
+class AuthService:
+    def require_role(self, user):
+        if not user.is_admin:
+            raise HTTPException(status_code=403)
+
+async def get_current_user(token):
+    return decode_token(token)
+""".strip()
+    chunks = chunk_source("auth.py", "python", code)
+    by_name = {chunk.symbol_name: chunk for chunk in chunks}
+
+    assert by_name["AuthService"].chunk_type == "class"
+    assert by_name["require_role"].chunk_type == "function"
+    assert by_name["get_current_user"].chunk_type == "async_function"
+    assert all(chunk.start_line > 0 and chunk.start_line <= chunk.end_line for chunk in chunks)
+
+
+def test_parser_creates_javascript_typescript_function_arrow_and_route_chunks():
+    from app.services.parser import chunk_source
+
+    code = """
+export function requireAuth(req, res, next) {
+  return next();
+}
+
+const requireRole = (role) => {
+  return (req, res, next) => next();
+};
+
+router.post("/admin", requireAuth, requireRole("admin"), (req, res) => {
+  res.send("ok");
+});
+""".strip()
+    chunks = chunk_source("routes.ts", "typescript", code)
+    chunk_types = [chunk.chunk_type for chunk in chunks]
+    names = [chunk.symbol_name for chunk in chunks]
+
+    assert "requireAuth" in names
+    assert "requireRole" in names
+    assert "route_handler" in chunk_types
+    assert all(chunk.start_line > 0 and chunk.start_line <= chunk.end_line for chunk in chunks)
+
+
+def test_security_detection_tags_fastapi_and_express_patterns():
+    from app.services.security_detection import detect_security_tags
+
+    fastapi_code = "@router.get('/admin', dependencies=[Depends(require_role)])\nraise HTTPException(status_code=status.HTTP_403_FORBIDDEN)"
+    express_code = "router.post('/admin', requireAuth, requireRole('admin')); jwt.verify(token, secret);"
+
+    assert "potential_access_check" in detect_security_tags(fastapi_code, "auth.py")
+    assert "potential_entry_point" in detect_security_tags(fastapi_code, "auth.py")
+    assert "potential_access_check" in detect_security_tags(express_code, "auth.ts")
+    assert "potential_entry_point" in detect_security_tags(express_code, "auth.ts")
 
 
 def test_chat_no_evidence_returns_safe_not_verified(isolated_env, monkeypatch):
@@ -229,8 +316,7 @@ def test_model_comparison_uses_shared_evidence_package(isolated_env, monkeypatch
             prompts.append(messages[-1]["content"])
             return {"content": json.dumps({"answer": "ok"}), "raw": {}, "ok": True}
 
-    monkeypatch.setattr(audit_service, "retrieve_evidence", lambda *args, **kwargs: shared_evidence)
-    monkeypatch.setattr(audit_service, "retrieve_wiki_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(audit_service, "retrieve_evidence_package", lambda *args, **kwargs: {"source_chunks": shared_evidence, "wiki_chunks": [], "chunk_ids": ["c1"], "retrieval_log": ""})
     monkeypatch.setattr(audit_service, "provider_for", lambda name: (FakeProvider(), f"{name}-model"))
 
     result = asyncio.run(audit_service.compare_models("project-1", CompareRequest(question="Where?", providers=["ollama", "openai"])))
@@ -239,3 +325,107 @@ def test_model_comparison_uses_shared_evidence_package(isolated_env, monkeypatch
     assert len(prompts) == 2
     assert prompts[0] == prompts[1]
     assert "Evidence 1" in prompts[0]
+
+
+def test_indexing_python_and_javascript_files_creates_chunks(isolated_env, monkeypatch):
+    from app.db.database import db, init_db
+    from app.db.schemas import ProjectCreate
+    from app.services import project_service
+
+    init_db()
+    monkeypatch.setattr(project_service, "index_code_chunk", lambda chunk: f"code:{chunk['id']}")
+    project = project_service.create_project(ProjectCreate(name="fixture", source_type="github"))
+    repo = Path(project["local_path"])
+    (repo / "app").mkdir()
+    (repo / "app" / "auth.py").write_text("def require_role(user):\n    return user.is_admin\n")
+    (repo / "app" / "routes.ts").write_text("router.post('/admin', requireRole('admin'), handler);\n")
+
+    project_service.index_project(project["id"])
+
+    with db() as connection:
+        files = [row["file_path"] for row in connection.execute("SELECT file_path FROM files WHERE project_id = ?", (project["id"],)).fetchall()]
+        chunks = [dict(row) for row in connection.execute("SELECT c.*, f.file_path FROM code_chunks c JOIN files f ON f.id = c.file_id WHERE c.project_id = ?", (project["id"],)).fetchall()]
+
+    assert "app/auth.py" in files
+    assert "app/routes.ts" in files
+    assert any(chunk["symbol_name"] == "require_role" for chunk in chunks)
+    assert any(chunk["file_path"] == "app/routes.ts" for chunk in chunks)
+
+
+def test_discovery_returns_python_and_jwt_security_fixtures(isolated_env, monkeypatch):
+    from app.db.database import init_db
+    from app.db.schemas import ProjectCreate
+    from app.services import project_service
+
+    init_db()
+    monkeypatch.setattr(project_service, "index_code_chunk", lambda chunk: f"code:{chunk['id']}")
+    project = project_service.create_project(ProjectCreate(name="fixture", source_type="github"))
+    repo = Path(project["local_path"])
+    (repo / "security.py").write_text("def require_role(user):\n    return user.role == 'admin'\n")
+    (repo / "auth.ts").write_text("export const validateJwt = (token) => jwt.verify(token, secret);\n")
+    project_service.index_project(project["id"])
+
+    role_results = project_service.discover_security_modules(project["id"], "role based access control endpoints")
+    jwt_results = project_service.discover_security_modules(project["id"], "jwt validation")
+
+    assert any(result["module_path"] == "security.py" for result in role_results)
+    assert any(result["module_path"] == "auth.ts" for result in jwt_results)
+
+
+def test_gemini_empty_default_model_resolves_to_flash(isolated_env, monkeypatch):
+    import asyncio
+
+    from app.core.config import get_settings
+    from app.services import model_health
+
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("GEMINI_DEFAULT_MODEL", "")
+    get_settings.cache_clear()
+
+    async def fake_ollama(settings):
+        return {"status": "Ollama not running"}
+
+    monkeypatch.setattr(model_health, "_ollama_health", fake_ollama)
+    settings = get_settings()
+    health = asyncio.run(model_health.models_health(settings))
+
+    assert settings.resolved_gemini_default_model == "gemini-2.5-flash"
+    assert health["gemini"]["status"] == "Ready"
+    assert health["gemini"]["default_model"] == "gemini-2.5-flash"
+
+
+def test_subfolder_import_indexes_only_selected_subfolder(isolated_env, monkeypatch):
+    from app.db.database import db, init_db
+    from app.db.schemas import ProjectCreate
+    from app.services import project_service
+
+    init_db()
+    monkeypatch.setattr(project_service, "index_code_chunk", lambda chunk: f"code:{chunk['id']}")
+    project = project_service.create_project(ProjectCreate(name="fixture", source_type="github", subfolder_path="services/api"))
+    repo = Path(project["local_path"])
+    (repo / "services" / "api").mkdir(parents=True)
+    (repo / "services" / "api" / "auth.py").write_text("def require_role(user):\n    return user.role\n")
+    (repo / "other").mkdir()
+    (repo / "other" / "auth.py").write_text("def ignored():\n    return True\n")
+
+    project_service.index_project(project["id"])
+
+    with db() as connection:
+        files = [row["file_path"] for row in connection.execute("SELECT file_path FROM files WHERE project_id = ?", (project["id"],)).fetchall()]
+
+    assert files == ["services/api/auth.py"]
+
+
+def test_missing_subfolder_marks_project_failed(isolated_env):
+    from app.db.database import init_db
+    from app.db.schemas import ProjectCreate
+    from app.services import project_service
+
+    init_db()
+    project = project_service.create_project(ProjectCreate(name="fixture", source_type="github", subfolder_path="missing/path"))
+
+    project_service.index_project(project["id"])
+    status = project_service.project_status(project["id"])
+
+    assert status["status"] == "failed"
+    assert "Selected subfolder does not exist" in status["status_message"]

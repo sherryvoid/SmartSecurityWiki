@@ -1,8 +1,23 @@
+# READ SUMMARY: This file excludes local environment, dependency, build, storage, and test-runtime artifacts from git.
+# CHANGED: Added Windows-safe pytest runtime folders produced during backend test runs.
 .env
 .env.example
 __pycache__/
 *.pyc
 .pytest_cache/
+.pytest_runtime/
+export-eval-pytest/
+parser-index-pytest/
+pytest-cache-files-*/
+retrieval-quality-pytest/
+single-test-pytest/
+structured-wiki-pytest/
+backend/.pytest_tmp/
+backend/.pytest_runtime/
+backend/.pytest_tmp_runtime/
+backend/pytest-runtime/
+backend/manual-test-runtime/
+backend/*.log
 node_modules/
 dist/
 storage/projects/*
@@ -13,8 +28,10 @@ backend/storage/
 frontend/dist/
 frontend/node_modules/
 frontend/*.log
+frontend/test-results/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+.vscode/
 answer2.md
 answers.md

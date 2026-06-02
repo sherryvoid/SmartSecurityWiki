@@ -1,3 +1,5 @@
+// READ SUMMARY: This page renders the project audit workspace, model controls, chat, comparison, wiki, and evidence cards.
+// CHANGED: Shows user-facing answer statuses and evidence re-ranking score badges from backend retrieval.
 import Editor from "@monaco-editor/react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
@@ -45,7 +47,9 @@ export default function ProjectWorkspace() {
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [wikiContext, setWikiContext] = useState<Array<{ title?: string; section_title?: string; content?: string }>>([]);
   const [contextUsed, setContextUsed] = useState("");
-  const [comparison, setComparison] = useState<Array<{ provider: string; model: string; answer: string; latency_ms: number }>>([]);
+  const [validationStatus, setValidationStatus] = useState("");
+  const [rawValidationStatus, setRawValidationStatus] = useState("");
+  const [comparison, setComparison] = useState<Array<{ evaluation_id: string; provider: string; model: string; answer: string; latency_ms: number; validation_status: string; display_status?: string }>>([]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -180,6 +184,8 @@ export default function ProjectWorkspace() {
       setEvidence(result.evidence as Evidence[]);
       setWikiContext(result.wiki_context as Array<{ title?: string; section_title?: string; content?: string }>);
       setContextUsed(result.context_used);
+      setRawValidationStatus(result.validation_status);
+      setValidationStatus(result.display_status ?? result.validation_status);
       setLastModelUsed(`${providerLabels[result.provider] ?? result.provider} / ${result.model}`);
       setLastVerification("");
       setMessage(`Answer ready with ${result.evidence.length} evidence block(s).`);
@@ -240,6 +246,14 @@ export default function ProjectWorkspace() {
         <section className="project-status">
           <h2>{project?.name ?? "Project"}</h2>
           <p>{project?.status ?? "loading"} / {project?.status_message}</p>
+          {project && (
+            <div className="project-meta">
+              {project.repo_url && <span>Repo: {project.repo_url}</span>}
+              {project.subfolder_path && <span>Subfolder: {project.subfolder_path}</span>}
+              <span>Local path: {project.local_path}</span>
+            </div>
+          )}
+          <ProgressStatus project={project} />
           <StatusSteps status={project?.status ?? "loading"} />
           <button onClick={loadProject} disabled={actionDisabled}><RefreshCcw size={16} /> Refresh</button>
         </section>
@@ -360,6 +374,10 @@ export default function ProjectWorkspace() {
               <article className="answer output-box">
                 <h4>Direct Answer</h4>
                 {contextUsed && <p className="context-used">Context used: {contextUsed}</p>}
+                {validationStatus && <p className="context-used">Validation: {validationStatus}</p>}
+                {rawValidationStatus === "invalid_json_fallback" && (
+                  <p className="validation-warning">Model answer was not fully structured/validated; evidence cards are still backend-generated.</p>
+                )}
                 <p>{answer}</p>
                 <div className="button-row verification-row">
                   {["Verified", "Incomplete", "Incorrect", "Needs Review"].map((verdict) => (
@@ -390,6 +408,14 @@ export default function ProjectWorkspace() {
                 >
                   <strong>{item.file_path}</strong>
                   <span>{item.symbol_name || "block"} / lines {item.start_line}-{item.end_line}</span>
+                  {typeof item.final_score === "number" && (
+                    <span
+                      className="score-badge"
+                      title={`Relevance: ${item.final_score.toFixed(2)} | Source: ${(item.file_weight ?? 1).toFixed(1)}x | Security: +${(item.security_boost ?? 0).toFixed(2)}`}
+                    >
+                      Relevance: {item.final_score.toFixed(2)} | Source: {(item.file_weight ?? 1).toFixed(1)}x | Security: +{(item.security_boost ?? 0).toFixed(2)}
+                    </span>
+                  )}
                   {item.critical_lines && item.critical_lines.length > 0 && <span>Critical lines: {item.critical_lines.join(", ")}</span>}
                   <code>{item.code_snippet.slice(0, 240)}</code>
                 </button>
@@ -414,11 +440,13 @@ export default function ProjectWorkspace() {
           {comparison.length > 0 && (
             <section className="tool-section">
               <h3>Model Evaluation</h3>
+              <p className="field-help">Manual evaluation feedback only. These scores are stored for thesis reporting and do not train or improve the models.</p>
               {comparison.map((item) => (
                 <article className="comparison-card output-box" key={item.provider}>
                   <strong>{item.provider} / {item.model}</strong>
-                  <span>{item.latency_ms} ms</span>
+                  <span>{item.latency_ms} ms / {item.display_status ?? item.validation_status}</span>
                   <p>{item.answer}</p>
+                  <EvaluationScoring projectId={projectId} evaluationId={item.evaluation_id} disabled={actionDisabled} onSaved={setMessage} />
                 </article>
               ))}
             </section>
@@ -435,6 +463,96 @@ export default function ProjectWorkspace() {
         </div>
       </aside>
     </main>
+  );
+}
+
+function EvaluationScoring({ projectId, evaluationId, disabled, onSaved }: { projectId: string; evaluationId: string; disabled: boolean; onSaved: (message: string) => void }) {
+  const [correctness, setCorrectness] = useState("");
+  const [evidenceQuality, setEvidenceQuality] = useState("");
+  const [correctFilePath, setCorrectFilePath] = useState("");
+  const [correctCodeBlock, setCorrectCodeBlock] = useState("");
+  const [explanationQuality, setExplanationQuality] = useState("");
+  const [completeness, setCompleteness] = useState("");
+  const [hallucinationFlag, setHallucinationFlag] = useState("");
+  const [usefulness, setUsefulness] = useState("");
+  const [comment, setComment] = useState("");
+
+  function nullableNumber(value: string) {
+    return value === "" ? null : Number(value);
+  }
+
+  async function save() {
+    await api.scoreEvaluation(projectId, evaluationId, {
+      correctness: nullableNumber(correctness),
+      evidence_quality: nullableNumber(evidenceQuality),
+      hallucination: hallucinationFlag === "" ? null : hallucinationFlag === "true",
+      notes: comment || null,
+      correct_file_path: nullableNumber(correctFilePath),
+      correct_code_block: nullableNumber(correctCodeBlock),
+      explanation_quality: nullableNumber(explanationQuality),
+      completeness: nullableNumber(completeness),
+      hallucination_flag: hallucinationFlag === "" ? null : hallucinationFlag === "true",
+      usefulness: nullableNumber(usefulness),
+      evaluator_comment: comment || null,
+    });
+    onSaved("Saved manual evaluation feedback.");
+  }
+
+  return (
+    <div className="evaluation-form">
+      <select value={correctness} onChange={(event) => setCorrectness(event.target.value)} disabled={disabled}>
+        <option value="">Correctness</option>
+        <option value="0">0 - wrong</option>
+        <option value="1">1 - partial</option>
+        <option value="2">2 - correct</option>
+      </select>
+      <select value={evidenceQuality} onChange={(event) => setEvidenceQuality(event.target.value)} disabled={disabled}>
+        <option value="">Evidence quality</option>
+        <option value="0">0 - no evidence</option>
+        <option value="1">1 - weak evidence</option>
+        <option value="2">2 - strong evidence</option>
+      </select>
+      <select value={correctFilePath} onChange={(event) => setCorrectFilePath(event.target.value)} disabled={disabled}>
+        <option value="">File path score</option>
+        <option value="0">0 - incorrect</option>
+        <option value="1">1 - partial</option>
+        <option value="2">2 - correct</option>
+      </select>
+      <select value={correctCodeBlock} onChange={(event) => setCorrectCodeBlock(event.target.value)} disabled={disabled}>
+        <option value="">Code block score</option>
+        <option value="0">0 - incorrect</option>
+        <option value="1">1 - partial</option>
+        <option value="2">2 - correct</option>
+      </select>
+      <select value={explanationQuality} onChange={(event) => setExplanationQuality(event.target.value)} disabled={disabled}>
+        <option value="">Explanation quality</option>
+        <option value="0">0 - poor</option>
+        <option value="1">1 - weak</option>
+        <option value="2">2 - good</option>
+        <option value="3">3 - excellent</option>
+      </select>
+      <select value={completeness} onChange={(event) => setCompleteness(event.target.value)} disabled={disabled}>
+        <option value="">Completeness</option>
+        <option value="0">0 - poor</option>
+        <option value="1">1 - weak</option>
+        <option value="2">2 - good</option>
+        <option value="3">3 - complete</option>
+      </select>
+      <select value={hallucinationFlag} onChange={(event) => setHallucinationFlag(event.target.value)} disabled={disabled}>
+        <option value="">Hallucination?</option>
+        <option value="false">No</option>
+        <option value="true">Yes</option>
+      </select>
+      <select value={usefulness} onChange={(event) => setUsefulness(event.target.value)} disabled={disabled}>
+        <option value="">Usefulness</option>
+        <option value="0">0 - poor</option>
+        <option value="1">1 - low</option>
+        <option value="2">2 - useful</option>
+        <option value="3">3 - very useful</option>
+      </select>
+      <textarea value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Evaluator comment" disabled={disabled} />
+      <button type="button" onClick={save} disabled={disabled}>Save Manual Evaluation</button>
+    </div>
   );
 }
 
@@ -455,9 +573,32 @@ function StatusBadge({ ready }: { ready: boolean }) {
   );
 }
 
+function ProgressStatus({ project }: { project: Project | null }) {
+  if (!project) return null;
+  const percent = project.progress_percent;
+  const hasPercent = typeof percent === "number";
+  return (
+    <div className="progress-panel">
+      <div className={hasPercent ? "progress-bar" : "progress-bar indeterminate"}>
+        {hasPercent && <span style={{ width: `${Math.max(0, Math.min(100, percent))}%` }} />}
+      </div>
+      <small>
+        {hasPercent ? `${percent}%` : "Progress unavailable"}
+        {typeof project.files_indexed === "number" && typeof project.total_files === "number" && ` / files ${project.files_indexed}/${project.total_files}`}
+        {typeof project.chunks_indexed === "number" && typeof project.total_chunks === "number" && ` / chunks ${project.chunks_indexed}/${project.total_chunks}`}
+      </small>
+      {project.current_file && <small>Current file: {project.current_file}</small>}
+    </div>
+  );
+}
+
 function StatusSteps({ status }: { status: string }) {
   const steps = [
     ["fetching", "Fetching repo"],
+    ["scanning", "Scanning files"],
+    ["indexing_files", "Indexing files"],
+    ["indexing_chunks", "Indexing chunks"],
+    ["embedding", "Embedding"],
     ["indexing", "Indexing code"],
     ["indexed", "Ready"],
   ];

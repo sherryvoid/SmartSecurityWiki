@@ -1,3 +1,5 @@
+// READ SUMMARY: This file wraps backend API calls and typed response shapes for the React frontend.
+// CHANGED: Added display_status fields alongside internal validation_status without changing existing parsing.
 import type { ModuleCandidate, Project } from "../types";
 
 const API_BASE = "/api";
@@ -41,6 +43,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers.set("Authorization", `Bearer ${token}`);
   }
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  if (response.status === 401) {
+    clearToken();
+    if (window.location.pathname !== "/login") {
+      window.location.assign("/login");
+    }
+    throw new Error("Your session expired or is invalid. Please log in again.");
+  }
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(detail || response.statusText);
@@ -57,6 +66,7 @@ export const api = {
   health: () => request<{ status: string }>("/health"),
   modelsHealth: () => request<ModelsHealth>("/models/health"),
   projects: () => request<Project[]>("/projects"),
+  deleteProject: (id: string) => request<{ deleted: boolean; message: string }>(`/projects/${id}`, { method: "DELETE" }),
   createProject: (payload: unknown) => request<Project>("/projects", { method: "POST", body: JSON.stringify(payload) }),
   createZipProject: (form: FormData) => request<Project>("/projects/zip", { method: "POST", body: form }),
   androidCaseStudies: () => request<Array<{ id: string; name: string; hint: string }>>("/projects/android-case-studies"),
@@ -76,14 +86,19 @@ export const api = {
     }),
   wikiPages: (id: string) => request<Array<{ id: string; title: string; content_markdown: string; module_id: string }>>(`/projects/${id}/wiki`),
   chat: (id: string, question: string, provider: string, model?: string, module_id?: string) =>
-    request<{ message_id: string; answer: string; evidence: unknown[]; wiki_context: unknown[]; context_used: string; provider: string; model: string }>(`/projects/${id}/chat`, {
+    request<{ message_id: string; answer: string; evidence: unknown[]; wiki_context: unknown[]; context_used: string; validation_status: string; display_status?: string; provider: string; model: string }>(`/projects/${id}/chat`, {
       method: "POST",
       body: JSON.stringify({ question, provider, model, module_id })
     }),
   compare: (id: string, question: string, providers: string[], module_id?: string) =>
-    request<{ question: string; evidence: unknown[]; wiki_context: unknown[]; results: Array<{ provider: string; model: string; answer: string; latency_ms: number }> }>(`/projects/${id}/compare-models`, {
+    request<{ question: string; evidence: unknown[]; wiki_context: unknown[]; results: Array<{ evaluation_id: string; provider: string; model: string; answer: string; latency_ms: number; validation_status: string; display_status?: string }> }>(`/projects/${id}/compare-models`, {
       method: "POST",
       body: JSON.stringify({ question, providers, module_id })
+    }),
+  scoreEvaluation: (id: string, evaluationId: string, payload: unknown) =>
+    request(`/projects/${id}/evaluations/${evaluationId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
     }),
   verify: (id: string, target_type: string, target_id: string, verdict: string, human_comment?: string) =>
     request(`/projects/${id}/verify`, {
@@ -93,7 +108,7 @@ export const api = {
 };
 
 export function exportUrl(projectId: string, format: "markdown" | "json" | "csv"): string {
-  return `${API_BASE}/projects/${projectId}/export/${format}`;
+  return `${API_BASE}/projects/${projectId}/export?format=${encodeURIComponent(format)}`;
 }
 
 export async function downloadExport(projectId: string, format: "markdown" | "json" | "csv"): Promise<void> {
@@ -101,6 +116,11 @@ export async function downloadExport(projectId: string, format: "markdown" | "js
   const response = await fetch(exportUrl(projectId, format), {
     headers: token ? { Authorization: `Bearer ${token}` } : {}
   });
+  if (response.status === 401) {
+    clearToken();
+    window.location.assign("/login");
+    throw new Error("Your session expired or is invalid. Please log in again.");
+  }
   if (!response.ok) {
     throw new Error(await response.text());
   }
