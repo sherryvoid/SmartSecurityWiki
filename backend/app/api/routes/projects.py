@@ -1,5 +1,5 @@
 # READ SUMMARY: This router exposes project import, browsing, wiki, chat, compare, scoring, deletion, and export endpoints.
-# CHANGED: Documented that chat and compare now delegate to the same shared retrieval package in audit_service.
+# CHANGED: Documented shared retrieval and added HTML audit report export support through /export/pdf.
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
@@ -10,10 +10,11 @@ from app.db.schemas import (
     DiscoverModulesRequest,
     EvaluationScoreRequest,
     ProjectCreate,
+    RunPurposeRequest,
     VerificationRequest,
     WikiGenerateRequest,
 )
-from app.services.audit_service import chat, compare_models, export_project, generate_wiki, list_wiki_pages, score_evaluation, verify
+from app.services.audit_service import chat, compare_models, delete_wiki_page, export_project, generate_wiki, list_wiki_pages, score_evaluation, verify
 from app.services.project_service import (
     ANDROID_CASE_STUDIES,
     create_project,
@@ -28,8 +29,15 @@ from app.services.project_service import (
     list_projects,
     project_status,
 )
+from app.services.methodology import list_formal_runs, update_run_purpose
+from app.services.usage_service import usage_summary
 
 router = APIRouter(prefix="/projects", tags=["projects"], dependencies=[Depends(require_user)])
+
+
+@router.get("/{project_id}/usage")
+def project_usage(project_id: str) -> dict:
+    return usage_summary(project_id)
 
 
 @router.get("")
@@ -124,6 +132,13 @@ def wiki_pages(project_id: str) -> list[dict]:
     return list_wiki_pages(project_id)
 
 
+
+@router.delete("/{project_id}/wiki/{wiki_page_id}")
+def wiki_delete(project_id: str, wiki_page_id: str) -> dict:
+    result = delete_wiki_page(project_id, wiki_page_id)
+    if not result.get("deleted"):
+        raise HTTPException(status_code=404, detail=result.get("message") or "Wiki page not found")
+    return result
 @router.post("/{project_id}/chat")
 async def chat_endpoint(project_id: str, request: ChatRequest) -> dict:
     # ASK PATH TRACE: calls audit_service.chat, which calls retrieve_evidence_package(project_id, request.question, 8, db_conn) once with no filters and uses returned wiki_chunks.
@@ -146,23 +161,36 @@ def evaluation_score(project_id: str, evaluation_id: str, request: EvaluationSco
     return score_evaluation(evaluation_id, request)
 
 
+@router.get("/{project_id}/formal-runs")
+def formal_runs(project_id: str) -> list[dict]:
+    return list_formal_runs(project_id)
+
+
+@router.patch("/{project_id}/runs/{run_id}/purpose")
+def run_purpose(project_id: str, run_id: str, request: RunPurposeRequest) -> dict:
+    try:
+        return update_run_purpose(project_id, run_id, request.run_purpose, request.question_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/{project_id}/export")
-def export_query(project_id: str, format: str = "markdown") -> Response:
+def export_query(project_id: str, format: str = "markdown", auditor_name: str = Depends(require_user)) -> Response:
     if format not in {"markdown", "json", "csv"}:
         raise HTTPException(status_code=400, detail="Export format must be markdown, json, or csv")
     try:
-        media_type, filename, content = export_project(project_id, "md" if format == "markdown" else format)
+        media_type, filename, content = export_project(project_id, "md" if format == "markdown" else format, auditor_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return Response(content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @router.get("/{project_id}/export/{export_format}")
-def export(project_id: str, export_format: str) -> Response:
-    if export_format not in {"markdown", "json", "csv"}:
-        raise HTTPException(status_code=400, detail="Export format must be markdown, json, or csv")
+def export(project_id: str, export_format: str, auditor_name: str = Depends(require_user)) -> Response:
+    if export_format not in {"markdown", "json", "csv", "pdf"}:
+        raise HTTPException(status_code=400, detail="Export format must be markdown, json, csv, or pdf")
     try:
-        media_type, filename, content = export_project(project_id, "md" if export_format == "markdown" else export_format)
+        media_type, filename, content = export_project(project_id, "md" if export_format == "markdown" else export_format, auditor_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return Response(content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})

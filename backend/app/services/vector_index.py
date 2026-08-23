@@ -1,5 +1,5 @@
 # READ SUMMARY: This module owns ChromaDB indexing/querying and embedding provider selection for code and wiki chunks.
-# CHANGED: Added generic retrieval re-scoring metadata so code evidence outranks prose without re-indexing projects.
+# CHANGED: Added endpoint metadata, security query expansion, selected-file preference, test-file penalties, and endpoint-role re-scoring boosts.
 import hashlib
 import logging
 import os
@@ -128,6 +128,7 @@ def code_embedding_text(chunk: dict) -> str:
             f"Symbol: {chunk.get('symbol_name') or ''}",
             f"Lines: {chunk['start_line']}-{chunk['end_line']}",
             f"Security Tags: {chunk.get('security_tags') or ''}",
+            f"HTTP Method: {chunk.get('http_method') or ''}",
             "Code:",
             chunk["code"],
         ]
@@ -167,6 +168,7 @@ def index_code_chunk(chunk: dict) -> str | None:
                     "security_tags": chunk.get("security_tags") or "",
                     "tags": chunk.get("security_tags") or "",
                     "chunk_type": chunk.get("chunk_type") or "",
+                    "http_method": chunk.get("http_method") or "",
                 }
             ],
         )
@@ -214,6 +216,15 @@ def index_wiki_page(project_id: str, wiki_page_id: str, module_id: str | None, t
         logger.warning("Could not index wiki page %s: %s", wiki_page_id, exc)
         return []
 
+
+
+def delete_wiki_page_vectors(project_id: str, wiki_page_id: str) -> bool:
+    try:
+        _collection(project_id).delete(where={"wiki_page_id": wiki_page_id})
+        return True
+    except Exception as exc:
+        logger.warning("Could not delete wiki vectors for page %s: %s", wiki_page_id, exc)
+        return False
 
 def split_wiki_markdown(markdown: str, max_lines: int = 80) -> list[dict]:
     lines = markdown.splitlines()
@@ -355,11 +366,94 @@ SECURITY_BOOST_TERMS = {
     "checkpermission",
     "enforcepermission",
     "preauthorize",
+    "hasrole",
+    "hasanyrole",
+    "hasauthority",
+    "secured",
+    "rolesallowed",
+    "permitall",
+    "denyall",
     "requestmapping",
     "webmvctest",
     "filter",
     "interceptor",
 }
+
+HTTP_VERB_TAGS = {
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "http_get",
+    "http_post",
+    "http_delete",
+    "http_put",
+    "http_patch",
+    "requestmapping",
+    "route_handler",
+    "getmapping",
+    "postmapping",
+    "putmapping",
+    "patchmapping",
+    "deletemapping",
+}
+
+ROLE_ANNOTATION_TAGS = {
+    "preauthorize",
+    "hasrole",
+    "hasanyrole",
+    "secured",
+    "rolesallowed",
+    "authorize",
+    "requires_auth",
+    "login_required",
+    "useguards",
+    "authenticated",
+    "permission_required",
+    "has_permission",
+}
+
+SECURITY_QUERY_EXPANSIONS = {
+    "access control": ["permission check", "authorization", "role check", "checkPermission", "hasRole", "authorizeRequests"],
+    "protected endpoint": ["PreAuthorize", "hasRole", "WebSecurityConfig", "SecurityFilterChain", "require_permissions", "login_required"],
+    "roles required": ["GrantedAuthority", "ROLE_", "roles claim", "UserRole", "RoleRequired"],
+    "who can access": ["allowed roles", "RBAC", "role based", "ACL"],
+    "jwt": ["Bearer token", "JwtAuthenticationConverter", "decode_token", "verify_token"],
+    "where is enforced": ["filter chain", "SecurityFilterChain", "checkPermission", "middleware", "interceptor"],
+    "authentication": ["login", "authenticate", "token validation", "JWT", "OAuth"],
+    "authorization": ["permission", "role check", "forbidden", "403", "hasAuthority"],
+    "spring security": ["WebSecurityConfigurerAdapter", "HttpSecurity", "antMatchers", "JwtAuthenticationFilter"],
+    "filter chain": ["OncePerRequestFilter", "doFilterInternal", "SecurityFilterChain"],
+    "fastapi": ["Depends", "OAuth2PasswordBearer", "get_current_user"],
+    "django": ["login_required", "IsAuthenticated", "permission_required"],
+    "go middleware": ["http.Handler", "ServeHTTP", "jwt.Parse", "ValidateToken"],
+    "kubernetes": ["SubjectAccessReview", "ClusterRole", "RoleBinding"],
+    "nestjs": ["CanActivate", "AuthGuard", "JwtAuthGuard", "UseGuards"],
+    "express": ["app.use", "req.user", "passport.authenticate", "jwt.verify"],
+    "android": ["checkPermission", "enforcePermission", "Binder.getCallingUid", "PackageManager"],
+    "selinux": ["avc_has_perm", "selinux_check_access", "allow rule"],
+    "dotnet": ["[Authorize]", "ClaimsPrincipal", "IsInRole", "AddAuthentication", "JwtBearerDefaults"],
+    "rails": ["before_action", "authenticate_user!", "Pundit"],
+    "rust": ["actix_web::guard", "validate_token", "jsonwebtoken"],
+}
+
+
+def expand_security_query(query: str) -> str:
+    q_lower = query.lower()
+    expansions = []
+    for keyword, synonyms in SECURITY_QUERY_EXPANSIONS.items():
+        if keyword.lower() in q_lower:
+            expansions.extend(synonyms[:3])
+    if not expansions:
+        return query
+    seen = []
+    for expansion in expansions:
+        if expansion not in seen:
+            seen.append(expansion)
+        if len(seen) >= 8:
+            break
+    return query + " " + " ".join(seen)
 
 
 def rescore_chunks(chunks: list) -> list:
@@ -372,15 +466,66 @@ def rescore_chunks(chunks: list) -> list:
         file_path = item.get("file_path") or metadata.get("file_path") or ""
         chunk_type = item.get("chunk_type") or metadata.get("chunk_type") or ""
         tags = item.get("tags", item.get("security_tags", metadata.get("tags", metadata.get("security_tags", []))))
-        file_weight = FILE_EXTENSION_WEIGHTS.get(os.path.splitext(str(file_path))[1].lower(), 1.0) if file_path else 1.0
+        tag_values = _tag_values(tags)
+        file_type_weight = FILE_EXTENSION_WEIGHTS.get(os.path.splitext(str(file_path))[1].lower(), 1.0) if file_path else 1.0
+        file_path_str = str(file_path).replace("\\", "/").lower()
+        is_test_file = (
+            "/test/" in file_path_str
+            or "/tests/" in file_path_str
+            or "/spec/" in file_path_str
+            or file_path_str.endswith("test.java")
+            or file_path_str.endswith("tests.java")
+            or file_path_str.endswith("spec.ts")
+            or file_path_str.endswith(".test.ts")
+            or file_path_str.endswith(".spec.ts")
+            or file_path_str.endswith("_test.go")
+            or file_path_str.endswith("test_.py")
+            or file_path_str.endswith("_test.py")
+            or file_path_str.endswith(".test.js")
+            or file_path_str.endswith(".spec.js")
+        )
+        test_file_penalty = 0.6 if is_test_file else 1.0
         chunk_type_weight = CHUNK_TYPE_WEIGHTS.get(str(chunk_type), 1.0) if chunk_type else 1.0
-        security_boost = 0.15 if _has_security_boost_tag(tags) else 0.0
-        final_score = (base_similarity * file_weight * chunk_type_weight) + security_boost
+        security_boost = 0.15 if _has_security_boost_tag(tag_values) else 0.0
+        http_method = item.get("http_method") or metadata.get("http_method") or ""
+        has_http_verb = bool(http_method or any(tag in HTTP_VERB_TAGS for tag in tag_values))
+        has_role_annotation = any(tag in ROLE_ANNOTATION_TAGS for tag in tag_values)
+        co_occurrence_boost = 0.20 if has_http_verb and has_role_annotation else 0.0
+        source_type = item.get("source_type") or metadata.get("source_type") or ""
+        wiki_boost = 0.10 if source_type == "wiki" else 0.0
+        selected_file_boost = float(item.get("selected_file_boost") or metadata.get("selected_file_boost") or 0.0)
+        lexical_relevance = _clamp(float(item.get("lexical_relevance") or 0.0))
+        symbol_relevance = _clamp(float(item.get("symbol_relevance") or 0.0))
+        exact_identifier_relevance = _clamp(float(item.get("exact_identifier_relevance") or 0.0))
+        evidence_role_relevance = _clamp(float(item.get("evidence_role_relevance") or 0.0))
+        # Keep semantic retrieval, but make query-specific lexical/symbol signals first-class.
+        # Generic security metadata remains a small tie-breaker and must not manufacture a
+        # perfect semantic score for chunks that were absent from the vector result set.
+        final_score = round(
+            (base_similarity * file_type_weight * chunk_type_weight * test_file_penalty)
+            + (0.35 * lexical_relevance)
+            + (0.45 * symbol_relevance)
+            + (0.45 * exact_identifier_relevance)
+            + (0.30 * evidence_role_relevance)
+            + security_boost + co_occurrence_boost + wiki_boost + selected_file_boost,
+            4,
+        )
         item["base_similarity"] = base_similarity
         item["final_score"] = final_score
-        item["file_weight"] = file_weight
+        item["file_weight"] = file_type_weight
+        item["file_type_weight"] = file_type_weight
+        item["test_file_penalty"] = test_file_penalty
         item["chunk_type_weight"] = chunk_type_weight
         item["security_boost"] = security_boost
+        item["co_occurrence_boost"] = co_occurrence_boost
+        item["wiki_boost"] = wiki_boost
+        item["selected_file_boost"] = selected_file_boost
+        item["lexical_relevance"] = lexical_relevance
+        item["symbol_relevance"] = symbol_relevance
+        item["exact_identifier_relevance"] = exact_identifier_relevance
+        item["evidence_role_relevance"] = evidence_role_relevance
+        if http_method:
+            item["http_method"] = http_method
         rescored.append(item)
     return sorted(rescored, key=lambda chunk: chunk.get("final_score", 0.0), reverse=True)
 
@@ -400,15 +545,20 @@ def _clamp(value: float) -> float:
 
 
 def _has_security_boost_tag(tags) -> bool:
+    tag_values = _tag_values(tags)
+    return any(term in tag for tag in tag_values for term in SECURITY_BOOST_TERMS)
+
+
+def _tag_values(tags) -> list[str]:
     if tags is None:
-        return False
+        return []
     if isinstance(tags, str):
         tag_values = [tag.strip() for tag in tags.replace(";", ",").split(",")]
     elif isinstance(tags, list):
         tag_values = [str(tag) for tag in tags]
     else:
         tag_values = [str(tags)]
-    return any(term in tag.lower() for tag in tag_values for term in SECURITY_BOOST_TERMS)
+    return [tag.lower().strip() for tag in tag_values if tag and str(tag).strip()]
 
 
 def code_chunk_exists(project_id: str, chunk_id: str) -> bool:

@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 import { LogOut } from "lucide-react";
 import { clearToken, getToken } from "./services/api";
@@ -12,6 +12,7 @@ function RequireAuth({ children }: { children: ReactNode }) {
 
 export default function App() {
   const navigate = useNavigate();
+  const location = useLocation();
   const logout = () => {
     clearToken();
     navigate("/login");
@@ -19,13 +20,13 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      {getToken() && (
+      {getToken() && !location.pathname.startsWith("/projects/") && (
         <header className="topbar">
           <div>
             <strong>Security CodeWiki</strong>
-            <span>Evidence-first source audit workspace</span>
+            <span>Create or open a project</span>
           </div>
-          <button className="icon-button" onClick={logout} title="Log out">
+          <button className="icon-button" aria-label="Log out" onClick={logout} title="Log out">
             <LogOut size={18} />
           </button>
         </header>

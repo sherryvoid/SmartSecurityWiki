@@ -1,3 +1,5 @@
+# READ SUMMARY: This test module verifies project export formats and manual evaluation scoring endpoints.
+# CHANGED: Added HTML audit report export coverage and seeded evaluation/wiki data for report assertions.
 import csv
 import io
 import json
@@ -64,8 +66,8 @@ def _seed_export_project() -> tuple[str, str]:
         connection.execute(
             """
             INSERT INTO evaluations
-            (id, project_id, module_path, question, model_provider, model_name, answer_text, evidence_json, validation_status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, project_id, module_path, question, model_provider, model_name, answer_text, evidence_json, validation_status, correctness_score, evidence_quality_score, hallucination_flag, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 evaluation_id,
@@ -77,8 +79,19 @@ def _seed_export_project() -> tuple[str, str]:
                 "Permission is checked in checkPermission.",
                 json.dumps(evidence),
                 "valid_json",
+                2,
+                2,
+                0,
                 timestamp,
             ),
+        )
+        connection.execute(
+            """
+            INSERT INTO wiki_pages
+            (id, project_id, module_id, title, slug, content_markdown, wiki_schema_version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("wiki-1", project_id, "src/AuthService.java", "Security Wiki", "security-wiki", "# Security Wiki\n\nAccess checks.", "1.0", timestamp, timestamp),
         )
     return project_id, evaluation_id
 
@@ -93,6 +106,7 @@ def test_export_endpoint_returns_markdown_content_disposition(monkeypatch):
     assert response.headers["content-disposition"].startswith('attachment; filename="Export_Demo_audit_report.md"')
     assert "# Security Audit Report" in response.text
     assert "## 1. Project Information" in response.text
+    assert "Generated Security Wiki content is used as orientation. Source-code and configuration chunks are the primary evidence." in response.text
     shutil.rmtree(temp_root, ignore_errors=True)
 
 
@@ -145,8 +159,25 @@ def test_evaluation_scoring_rejects_out_of_range_correctness(monkeypatch):
     response = client.patch(
         f"/api/projects/{project_id}/evaluations/{evaluation_id}",
         headers=headers,
-        json={"correctness": 3, "evidence_quality": 1, "hallucination": False},
+        json={"correctness": 4, "evidence_quality": 1, "hallucination": False},
     )
 
     assert response.status_code == 422
+    shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_export_html_structure(monkeypatch):
+    client, headers, temp_root = _client_and_headers(monkeypatch)
+    project_id, _ = _seed_export_project()
+
+    response = client.get(f"/api/projects/{project_id}/export/pdf", headers=headers)
+
+    assert response.status_code == 200
+    assert "attachment" in response.headers["content-disposition"]
+    assert "<html" in response.text
+    assert "Security Audit Report" in response.text
+    assert "Auditor Verification" in response.text
+    assert "Evaluation Scores" in response.text
+    assert "System Limitations" in response.text
+    assert "Generated Security Wiki content is used as orientation. Source-code and configuration chunks are the primary evidence." in response.text
     shutil.rmtree(temp_root, ignore_errors=True)

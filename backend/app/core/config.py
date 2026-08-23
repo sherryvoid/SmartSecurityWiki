@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_default_model: str = "qwen3.5:9b"
     ollama_timeout_seconds: float = 60.0
+    ollama_think_enabled: bool = False
+    ollama_num_predict: int = 2048
+    ollama_context_length: int = 8192
 
     openai_api_key: str = ""
     openai_default_model: str = "gpt-4o-mini"
@@ -27,10 +30,27 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_default_model: str = "gemini-1.5-flash"
     gemini_timeout_seconds: float = 120.0
-    deepseek_api_key: str = ""
-    deepseek_default_model: str = "deepseek-chat"
-    deepseek_timeout_seconds: float = 120.0
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_default_model: str = "openai/gpt-oss-20b"
+    groq_active_models: str = "openai/gpt-oss-20b"
+    groq_reasoning_effort: str = "medium"
+    groq_reasoning_format: str = "not_supported"
+    groq_include_reasoning: bool = False
+    groq_max_output_tokens: int = 2048
+    groq_timeout_seconds: float = 120.0
     cloud_llm_timeout_seconds: float = 120.0
+    selected_file_min_chunks: int = 3
+    selected_file_max_chunks: int = 5
+    compare_source_chunk_limit: int = 10
+    primary_source_top_k: int = 10
+    wiki_context_enabled: bool = True
+    wiki_context_top_k: int = 2
+    evaluation_config_revision: str = "phase4.5-v1"
+    prompt_version: str = "ask-v4.5"
+    prompt_serialization_version: str = "compact-evidence-v1"
+    wiki_prompt_version: str = "wiki-v4.5"
+    diagnostic_raw_response_max_chars: int = 8000
 
     embedding_provider: str = "sentence-transformers"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
@@ -49,6 +69,10 @@ class Settings(BaseSettings):
     @property
     def resolved_gemini_default_model(self) -> str:
         return self.gemini_default_model.strip() or "gemini-2.5-flash"
+
+    @property
+    def groq_active_model_ids(self) -> list[str]:
+        return [value.strip() for value in self.groq_active_models.split(",") if value.strip()]
 
     def ensure_storage(self) -> None:
         for path in [

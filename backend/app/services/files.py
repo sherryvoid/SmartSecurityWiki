@@ -1,6 +1,6 @@
+# READ SUMMARY: This module filters source files, detects language by extension, reads files, and builds file trees.
+# CHANGED: Added Kotlin, C#, and Rust as relevant source extensions for endpoint/security chunking.
 from pathlib import Path
-
-
 INCLUDE_EXTENSIONS = {
     ".java",
     ".go",
@@ -20,6 +20,9 @@ INCLUDE_EXTENSIONS = {
     ".yaml",
     ".yml",
     ".te",
+    ".kt",
+    ".cs",
+    ".rs",
     ".md",
     ".txt",
 }
@@ -72,6 +75,9 @@ def language_for_path(path: str) -> str:
         ".yaml": "yaml",
         ".yml": "yaml",
         ".te": "selinux",
+        ".kt": "kotlin",
+        ".cs": "csharp",
+        ".rs": "rust",
         ".md": "markdown",
         ".txt": "text",
     }.get(suffix, "text")

@@ -101,3 +101,35 @@ def test_invalid_wiki_json_returns_parse_failed_fallback():
     assert raw_response == "this is not json"
     assert validation_status == "invalid_json_fallback"
     assert wiki.model_dump()["parse_failed"] is True
+
+
+def test_validate_wiki_chunk_ids_clears_invalid_helper_reference(monkeypatch):
+    from app.db.schemas import SecurityWikiSchema
+    from app.services import audit_service
+
+    payload = minimal_wiki_payload()
+    wiki = SecurityWikiSchema.model_validate(payload)
+    monkeypatch.setattr(audit_service, "code_chunk_exists", lambda project_id, chunk_id: chunk_id == "chunk-1")
+
+    audit_service.validate_wiki_chunk_ids("project-1", wiki)
+
+    assert wiki.entry_points[0].chunk_id == "chunk-1"
+    assert wiki.vertical_helpers[0].chunk_id is None
+    assert "invalid generated chunk reference" in wiki.limitations
+
+
+def test_validate_wiki_chunk_ids_clears_invalid_requirement_trace_reference(monkeypatch):
+    from app.db.schemas import SecurityWikiSchema
+    from app.services import audit_service
+
+    payload = minimal_wiki_payload()
+    payload["requirement_traces"][0]["chunk_id"] = "missing-requirement-chunk"
+    wiki = SecurityWikiSchema.model_validate(payload)
+    monkeypatch.setattr(audit_service, "code_chunk_exists", lambda project_id, chunk_id: chunk_id in {"chunk-1", "chunk-2"})
+
+    audit_service.validate_wiki_chunk_ids("project-1", wiki)
+
+    assert wiki.entry_points[0].chunk_id == "chunk-1"
+    assert wiki.vertical_helpers[0].chunk_id == "chunk-2"
+    assert wiki.requirement_traces[0].chunk_id is None
+    assert "invalid generated chunk reference" in wiki.limitations

@@ -1,5 +1,5 @@
 # READ SUMMARY: This test module covers shared retrieval, query-time scoring, display status mapping, and timeout handling.
-# CHANGED: Added regression tests for Ask/Compare evidence consistency, source-code weighting, status labels, and graceful model timeout behavior.
+# CHANGED: Added regression tests for Ask/Compare evidence consistency, source/test weighting, annotation tags, status labels, and graceful timeouts.
 import asyncio
 import json
 
@@ -88,6 +88,7 @@ def test_ask_and_compare_retrieve_same_chunks(isolated_env, monkeypatch):
                 "ok": True,
             }
 
+    monkeypatch.setattr(audit_service, "is_provider_available", lambda name: True)
     monkeypatch.setattr(audit_service, "provider_for", lambda name: (FakeProvider(), f"{name}-model"))
 
     chat_result = asyncio.run(audit_service.chat(project_id, ChatRequest(question="access control check", provider="ollama")))
@@ -98,6 +99,51 @@ def test_ask_and_compare_retrieve_same_chunks(isolated_env, monkeypatch):
     assert set(chat_ids) == set(compare_ids)
     assert chat_ids == compare_ids
 
+def test_selected_file_gets_preference_boost(isolated_env, monkeypatch):
+    from app.db.database import db, init_db
+    from app.services import project_service
+
+    init_db()
+    project_id = _insert_project_chunks()
+    monkeypatch.setattr(project_service, "vector_query", lambda *args, **kwargs: [])
+
+    with db() as connection:
+        result = project_service.retrieve_evidence_package(
+            project_id,
+            "access control check",
+            10,
+            connection,
+            module_id="src/WebSecurityConfig.java",
+        )
+
+    selected = next(item for item in result["source_chunks"] if item["chunk_id"] == "c1")
+    unselected = next(item for item in result["source_chunks"] if item["chunk_id"] == "c2")
+    assert selected["selected_file_match"] is True
+    assert selected["selected_file_boost"] > 0
+    assert unselected["selected_file_match"] is False
+    assert unselected["selected_file_boost"] == 0.0
+
+
+def test_selected_file_preference_does_not_exclude_helpers(isolated_env, monkeypatch):
+    from app.db.database import db, init_db
+    from app.services import project_service
+
+    init_db()
+    project_id = _insert_project_chunks()
+    monkeypatch.setattr(project_service, "vector_query", lambda *args, **kwargs: [])
+
+    with db() as connection:
+        result = project_service.retrieve_evidence_package(
+            project_id,
+            "access control check",
+            10,
+            connection,
+            module_id="README.md",
+        )
+
+    chunk_ids = {item["chunk_id"] for item in result["source_chunks"]}
+    assert "c2" in chunk_ids
+    assert "c1" in chunk_ids
 
 def test_rescore_prefers_source_over_readme():
     from app.services.vector_index import rescore_chunks
@@ -109,6 +155,134 @@ def test_rescore_prefers_source_over_readme():
 
     assert rescored[0]["file_path"] == "WebSecurityConfig.java"
     assert rescored[0]["final_score"] > rescored[1]["final_score"]
+
+
+def test_implementation_ranks_above_test_file():
+    from app.services.vector_index import rescore_chunks
+
+    chunk_impl = {
+        "distance": 0.3,
+        "metadata": {
+            "file_path": "src/main/java/ProductController.java",
+            "chunk_type": "method",
+            "tags": ["preauthorize", "hasrole"],
+        },
+    }
+    chunk_test = {
+        "distance": 0.3,
+        "metadata": {
+            "file_path": "src/test/java/RbacWebMvcTests.java",
+            "chunk_type": "method",
+            "tags": ["rbac", "test"],
+        },
+    }
+
+    result = rescore_chunks([chunk_test, chunk_impl])
+
+    assert result[0]["metadata"]["file_path"].endswith("ProductController.java"), (
+        "Implementation file must rank above test file for same similarity score"
+    )
+
+
+def test_co_occurrence_boost_applied():
+    from app.services.vector_index import rescore_chunks
+
+    chunk = {
+        "distance": 0.3,
+        "metadata": {
+            "file_path": "ProductController.java",
+            "chunk_type": "method",
+            "http_method": "GET",
+            "tags": ["preauthorize", "staff_member", "getmapping"],
+        },
+    }
+
+    result = rescore_chunks([chunk])
+
+    assert result[0]["co_occurrence_boost"] == 0.20
+
+
+def test_no_co_occurrence_boost_without_role():
+    from app.services.vector_index import rescore_chunks
+
+    chunk = {
+        "distance": 0.3,
+        "metadata": {
+            "file_path": "ProductController.java",
+            "chunk_type": "method",
+            "http_method": "GET",
+            "tags": ["getmapping"],
+        },
+    }
+
+    result = rescore_chunks([chunk])
+
+    assert result[0]["co_occurrence_boost"] == 0.0
+
+
+def test_endpoint_method_beats_jwt_helper():
+    from app.services.vector_index import rescore_chunks
+
+    chunk_endpoint = {
+        "distance": 0.3,
+        "metadata": {
+            "file_path": "src/main/java/ProductController.java",
+            "chunk_type": "method",
+            "http_method": "GET",
+            "tags": ["preauthorize", "staff_member", "getmapping"],
+        },
+    }
+    chunk_jwt = {
+        "distance": 0.3,
+        "metadata": {
+            "file_path": "src/main/java/JwtHelper.java",
+            "chunk_type": "method",
+            "tags": ["jwt", "token"],
+        },
+    }
+
+    result = rescore_chunks([chunk_jwt, chunk_endpoint])
+
+    assert result[0]["metadata"]["file_path"].endswith("ProductController.java")
+
+
+def test_security_detection_adds_spring_annotation_tags():
+    from app.services.security_detection import detect_security_tags
+
+    tags = detect_security_tags('@PreAuthorize("hasRole(\'MANAGER\')")\npublic void createProduct() {}', "ProductController.java")
+
+    assert "preauthorize" in tags
+    assert "hasrole" in tags
+
+
+def test_expand_query_adds_security_terms():
+    from app.services.vector_index import expand_security_query
+
+    result = expand_security_query("where is access control enforced?")
+    result2 = expand_security_query("what color is the button?")
+
+    assert len(result) > len("where is access control enforced?")
+    assert result2 == "what color is the button?"
+
+
+def test_expand_query_python_stack():
+    from app.services.vector_index import expand_security_query
+
+    result = expand_security_query("how does fastapi authentication work?")
+
+    assert any(term in result for term in ["OAuth2PasswordBearer", "get_current_user", "Depends"])
+
+
+def test_provider_availability_cloud_keys(monkeypatch):
+    from types import SimpleNamespace
+    from app.services import llm
+
+    settings = SimpleNamespace(gemini_api_key="fake-key-for-test", openai_api_key="", deepseek_api_key="", ollama_base_url="http://localhost:11434")
+    monkeypatch.setattr(llm, "get_settings", lambda: settings)
+    assert llm.is_provider_available("gemini") is True
+    settings.gemini_api_key = ""
+    assert llm.is_provider_available("gemini") is False
+    assert llm.is_provider_available("openai") is False
 
 
 @pytest.mark.parametrize(
@@ -224,10 +398,13 @@ def test_compare_continues_after_timeout(isolated_env, monkeypatch):
             return TimeoutProvider(), "ollama-model"
         return ValidProvider(), "gemini-model"
 
+    monkeypatch.setattr(audit_service, "is_provider_available", lambda name: True)
     monkeypatch.setattr(audit_service, "provider_for", fake_provider_for)
 
     result = asyncio.run(audit_service.compare_models("project-1", CompareRequest(question="Where?", providers=["ollama", "gemini"])))
 
     assert len(result["results"]) == 2
     assert result["results"][0]["validation_status"] == "timeout"
-    assert result["results"][1]["answer"] == "Valid answer."
+    assert result["results"][1]["answer_preview"] == "Valid answer."
+    assert "Valid answer." in result["results"][1]["full_answer"]
+    assert "Summary." in result["results"][1]["full_answer"]

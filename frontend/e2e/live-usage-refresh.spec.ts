@@ -1,0 +1,30 @@
+import { expect, test } from "@playwright/test";
+
+test("Ask and multi-provider Compare refresh Usage without reloading", async ({page}) => {
+  await page.addInitScript(() => localStorage.setItem("security_codewiki_token","test"));
+  let executions = 0;
+  const health={ollama:{reachable:true,available:true,reason:"Ready",available_models:["local-a"],default_model:"local-a",default_model_exists:true,status:"Ready"},gemini:{available:true,reason:"Ready",status:"Ready",api_key_configured:true,default_model_configured:true,default_model:"cloud-a"},openai:{available:false,reason:"Not configured",status:"Not configured",api_key_configured:false,default_model_configured:true,default_model:"gpt-4o-mini"},embedding:{provider:"hash",model:"test",semantic:false,fallback_used:true,label:"test"}};
+  await page.route("**/api/models/health",r=>r.fulfill({json:health}));
+  await page.route("**/api/projects/live/status",r=>r.fulfill({json:{status:"indexed",project:{id:"live",name:"Live",source_type:"local",local_path:"repo",status:"indexed",status_message:"Ready",created_at:"now",updated_at:"now"}}}));
+  await page.route("**/api/projects/live/files/tree",r=>r.fulfill({json:[]}));
+  await page.route("**/api/projects/live/wiki",r=>r.fulfill({json:[]}));
+  await page.route("**/api/projects/live/formal-runs",r=>r.fulfill({json:[]}));
+  await page.route("**/api/projects/live/usage",r=>r.fulfill({json:{overview:{requests:executions,actual_input_tokens:executions?100:null,actual_output_tokens:executions?20:null,actual_total_tokens:executions?120:null,cached_tokens:null,actual_provider_api_cost:executions?0:null,gpt_equivalent_estimate:executions?.000027:null,local_model_generation_time_ms:null},scenario_pricing:{revision:"fixture-v1",effective_date:"2026-01-01"},by_model:[],by_operation:[],recent_executions:[]}}));
+  await page.route("**/api/projects/live/chat",async r=>{executions=1;await r.fulfill({json:{message_id:"m",answer:"Full Ask answer",evidence:[],wiki_context:[],context_used:"source",validation_status:"valid",provider:"gemini",model:"cloud-a"}})});
+  await page.route("**/api/projects/live/compare-models",async r=>{executions=3;await r.fulfill({json:{question:"q",evidence:[],wiki_context:[],results:[],comparison_valid:true,run_summary:{execution_id:"r",question:"q",shared_evidence_package_id:"p",shared_evidence_hash:"h",comparison_valid:true,started_at:"now",completed_at:"now",total_duration:1,selected_models:[]}}})});
+  await page.goto("/projects/live");
+  await page.getByRole("button",{name:"Ask",exact:true}).click();
+  await page.getByLabel("Question").fill("generic question");
+  await page.getByRole("button",{name:"Run analysis"}).click();
+  await page.getByLabel("Model settings").click(); await page.getByRole("button",{name:/Usage & Cost/}).click();
+  await expect(page.getByText("1",{exact:true}).first()).toBeVisible();
+  await page.getByLabel("Close Usage & Cost").click();
+  await page.getByRole("button",{name:"Compare",exact:true}).click();
+  await page.getByLabel("Question").fill("generic compare question");
+  await page.getByRole("button",{name:"Compare models"}).click();
+  await page.getByLabel("Model settings").click(); await page.getByRole("button",{name:/Usage & Cost/}).click();
+  await expect(page.getByText("3",{exact:true}).first()).toBeVisible();
+  await expect(page.getByText("GPT-4o-mini equivalent estimate")).toBeVisible();
+  await expect(page.getByText(/Actual OpenAI tokenization/)).toBeVisible();
+  await page.screenshot({path:"e2e/screenshots/live-usage-refresh.png",fullPage:true});
+});

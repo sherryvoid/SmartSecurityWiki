@@ -1,3 +1,7 @@
+# READ SUMMARY: This module detects security-relevant keywords and tags chunks for retrieval/scoring.
+# CHANGED: Added exact endpoint/security annotation tags and role-value extraction for protected route chunks.
+import re
+
 SECURITY_KEYWORDS = {
     "permission": "potential_access_check",
     "authorize": "potential_access_check",
@@ -20,7 +24,19 @@ SECURITY_KEYWORDS = {
     "Forbidden": "potential_access_check",
     "hasPermission": "potential_access_check",
     "hasRole": "potential_access_check",
+    "hasAnyRole": "potential_access_check",
     "hasAuthority": "potential_access_check",
+    "hasAnyAuthority": "potential_access_check",
+    "@PreAuthorize": "potential_access_check",
+    "PreAuthorize": "potential_access_check",
+    "@Secured": "potential_access_check",
+    "Secured": "potential_access_check",
+    "@RolesAllowed": "potential_access_check",
+    "RolesAllowed": "potential_access_check",
+    "@PermitAll": "potential_access_check",
+    "@DenyAll": "potential_access_check",
+    "PermitAll": "potential_access_check",
+    "DenyAll": "potential_access_check",
     "authenticated": "potential_access_check",
     "requestMatchers": "potential_entry_point",
     "antMatchers": "potential_entry_point",
@@ -82,16 +98,83 @@ SECURITY_KEYWORDS = {
     "RolesGuard": "potential_access_check",
     "ForbiddenException": "potential_access_check",
     "UnauthorizedException": "potential_access_check",
+    "[Authorize": "potential_access_check",
+    "[AllowAnonymous": "potential_access_check",
+}
+
+EXACT_SECURITY_TAG_KEYWORDS = {
+    "preauthorize": "preauthorize",
+    "hasrole": "hasrole",
+    "hasanyrole": "hasanyrole",
+    "hasauthority": "hasauthority",
+    "hasanyauthority": "hasauthority",
+    "secured": "secured",
+    "rolesallowed": "rolesallowed",
+    "permitall": "permitall",
+    "denyall": "denyall",
+    "authorize": "authorize",
+    "allowanonymous": "allowanonymous",
+    "login_required": "login_required",
+    "permission_required": "permission_required",
+    "require_permissions": "requires_auth",
+    "get_current_user": "get_current_user",
+    "depends(get_current_user": "authenticated",
+    "isauthenticated": "authenticated",
+    "has_permission": "has_permission",
+    "useguards": "useguards",
+    "authguard": "requires_auth",
+    "canactivate": "canactivate",
+    "jwtmiddleware": "requires_auth",
+    "authrequired": "requires_auth",
+    "requireauth": "requires_auth",
+    "getmapping": "getmapping",
+    "postmapping": "postmapping",
+    "putmapping": "putmapping",
+    "patchmapping": "patchmapping",
+    "deletemapping": "deletemapping",
+    "requestmapping": "requestmapping",
+    "httpget": "http_get",
+    "httppost": "http_post",
+    "httpput": "http_put",
+    "httppatch": "http_patch",
+    "httpdelete": "http_delete",
 }
 
 
 def detect_security_tags(text: str, file_path: str = "") -> list[str]:
     haystack = f"{file_path}\n{text}"
-    tags = {tag for keyword, tag in SECURITY_KEYWORDS.items() if keyword.lower() in haystack.lower()}
+    haystack_lower = haystack.lower()
+    tags = {tag for keyword, tag in SECURITY_KEYWORDS.items() if keyword.lower() in haystack_lower}
+    tags.update(tag for keyword, tag in EXACT_SECURITY_TAG_KEYWORDS.items() if keyword in haystack_lower)
+    tags.update(_extract_role_tags(haystack))
     suffix = file_path.lower()
     if suffix.endswith((".xml", ".json", ".yaml", ".yml", ".te")) and tags:
         tags.add("potential_config_file")
     return sorted(tags)
+
+
+def _extract_role_tags(text: str) -> set[str]:
+    roles: set[str] = set()
+    for match in re.finditer(r"has(?:any)?role\s*\((?P<args>[^)]*)\)", text, flags=re.IGNORECASE):
+        roles.update(_quoted_values(match.group("args")))
+    for match in re.finditer(r"roles\s*=\s*[\"'](?P<roles>[^\"']+)[\"']", text, flags=re.IGNORECASE):
+        roles.update(part.strip() for part in match.group("roles").split(","))
+    for match in re.finditer(r"@rolesallowed\s*\((?P<args>[^)]*)\)", text, flags=re.IGNORECASE):
+        roles.update(_quoted_values(match.group("args")))
+    for match in re.finditer(r"@roles\s*\((?P<args>[^)]*)\)", text, flags=re.IGNORECASE):
+        roles.update(_quoted_values(match.group("args")))
+    return {_normalize_role(role) for role in roles if _normalize_role(role)}
+
+
+def _quoted_values(value: str) -> set[str]:
+    return {match.group(1) for match in re.finditer(r"[\"']([^\"']+)[\"']", value)}
+
+
+def _normalize_role(role: str) -> str:
+    cleaned = role.strip().strip("\"'").lower()
+    if cleaned.startswith("role_"):
+        cleaned = cleaned[5:]
+    return re.sub(r"[^a-z0-9_]+", "_", cleaned).strip("_")
 
 
 def confidence_for_tags(tags: list[str]) -> str:

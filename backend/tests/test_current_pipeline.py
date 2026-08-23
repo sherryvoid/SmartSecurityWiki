@@ -31,6 +31,20 @@ def test_db_schema_initialization(isolated_env):
     }.issubset(tables)
 
 
+
+def test_create_project_trims_repo_url_whitespace(isolated_env):
+    from app.db.database import init_db
+    from app.db.schemas import ProjectCreate
+    from app.services import project_service
+
+    init_db()
+    project = project_service.create_project(
+        ProjectCreate(name="fixture", source_type="github", repo_url=" https://github.com/example/repo.git ")
+    )
+
+    assert project["repo_url"] == "https://github.com/example/repo.git"
+
+
 def test_zip_safe_extraction_allows_normal_zip(isolated_env, tmp_path):
     from app.services.project_service import _safe_extract_zip
 
@@ -247,8 +261,20 @@ def test_wiki_generation_stores_wiki_page(isolated_env, monkeypatch):
 
     class FakeProvider:
         async def generate(self, messages, model, temperature=0.1):
-            return {"content": "# Security Wiki\n\nEvidence-backed notes.", "raw": {}, "ok": True}
+            return {
+                "content": json.dumps({
+                    "module_overview": "Evidence-backed notes.",
+                    "entry_points": [],
+                    "access_control_matrix": [],
+                    "vertical_helpers": [],
+                    "requirement_traces": [],
+                    "limitations": "No additional limitations.",
+                }),
+                "raw": {},
+                "ok": True,
+            }
 
+    monkeypatch.setattr(audit_service, "is_provider_available", lambda name: True)
     monkeypatch.setattr(audit_service, "provider_for", lambda name: (FakeProvider(), "fake-model"))
     monkeypatch.setattr(audit_service, "retrieve_evidence", lambda *args, **kwargs: [{"chunk_id": "c1", "file_path": "A.java", "symbol_name": "m", "start_line": 1, "end_line": 2, "security_tags": "", "code_snippet": "checkPermission();"}])
     monkeypatch.setattr(audit_service, "index_wiki_page", lambda *args, **kwargs: ["wiki:1:0"])
@@ -317,6 +343,7 @@ def test_model_comparison_uses_shared_evidence_package(isolated_env, monkeypatch
             return {"content": json.dumps({"answer": "ok"}), "raw": {}, "ok": True}
 
     monkeypatch.setattr(audit_service, "retrieve_evidence_package", lambda *args, **kwargs: {"source_chunks": shared_evidence, "wiki_chunks": [], "chunk_ids": ["c1"], "retrieval_log": ""})
+    monkeypatch.setattr(audit_service, "is_provider_available", lambda name: True)
     monkeypatch.setattr(audit_service, "provider_for", lambda name: (FakeProvider(), f"{name}-model"))
 
     result = asyncio.run(audit_service.compare_models("project-1", CompareRequest(question="Where?", providers=["ollama", "openai"])))
@@ -324,7 +351,7 @@ def test_model_comparison_uses_shared_evidence_package(isolated_env, monkeypatch
     assert len(result["results"]) == 2
     assert len(prompts) == 2
     assert prompts[0] == prompts[1]
-    assert "Evidence 1" in prompts[0]
+    assert "[E1]" in prompts[0]
 
 
 def test_indexing_python_and_javascript_files_creates_chunks(isolated_env, monkeypatch):
@@ -429,3 +456,16 @@ def test_missing_subfolder_marks_project_failed(isolated_env):
 
     assert status["status"] == "failed"
     assert "Selected subfolder does not exist" in status["status_message"]
+
+def test_ollama_think_tags_stripped():
+    from app.services.llm import _strip_think_tags
+    raw = "<think>I am thinking</think>The answer is here."
+    result = _strip_think_tags(raw)
+    assert "<think>" not in result
+    assert "The answer is here." in result
+
+def test_ollama_simple_prompt_has_no_json_schema():
+    from app.services.llm import SIMPLE_PROMPT_TEMPLATE
+    assert "{" not in SIMPLE_PROMPT_TEMPLATE.replace("{evidence_text}", "").replace("{question}", "")
+    assert "FILE:" in SIMPLE_PROMPT_TEMPLATE
+    assert "CONFIDENCE:" in SIMPLE_PROMPT_TEMPLATE

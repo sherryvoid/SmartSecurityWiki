@@ -7,7 +7,7 @@ async function login(page: Page) {
   await page.goto('/login');
   await expect(page.locator('input[type="password"]')).toBeVisible();
   await page.getByLabel('Username').fill(username);
-  await page.getByLabel('Password').fill(password);
+  await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: /login/i }).click();
   await expect(page.getByRole('heading', { name: /projects|create project/i }).first()).toBeVisible();
 }
@@ -29,7 +29,7 @@ test('Login flow', async ({ page }, testInfo) => {
   await page.goto('/');
   await expect(page.locator('input[type="password"]')).toBeVisible();
   await page.getByLabel('Username').fill(username);
-  await page.getByLabel('Password').fill(password);
+  await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: /login/i }).click();
 
   await expect(page.getByRole('heading', { name: /projects|create project/i }).first()).toBeVisible();

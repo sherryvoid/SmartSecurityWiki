@@ -1,5 +1,5 @@
 # READ SUMMARY: This module defines Pydantic request/response schemas used by the FastAPI backend.
-# CHANGED: Added user-facing display status mapping while preserving internal validation_status values.
+# CHANGED: Added user-facing display status mapping plus optional compare provider model overrides.
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -79,13 +79,32 @@ class ChatAnswer(BaseModel):
 # parse_failed, no_evidence, no_source_evidence, timeout, error, valid_json_repaired.
 DISPLAY_STATUS_MAP = {
     "valid_json": "Answer verified",
-    "invalid_json_fallback": "Answer generated",
-    "valid_with_dropped_invalid_evidence_refs": "Some evidence references could not be verified",
+    "valid_simple": "Valid local answer",
+    "invalid_json_fallback": "Invalid structured answer",
+    "valid_with_dropped_invalid_evidence_refs": "Valid answer (dropped invalid evidence)",
     "parse_failed": "Answer generated (unstructured)",
-    "no_evidence": "Insufficient evidence",
+    "no_evidence": "No evidence retrieved",
     "no_source_evidence": "Insufficient evidence",
     "timeout": "Model timed out",
     "error": "Model error",
+    "completed": "Completed",
+    "completed_with_warnings": "Completed with warnings",
+    "provider_unavailable": "Provider unavailable",
+    "provider_timeout": "Provider timed out",
+    "empty_response": "Empty response",
+    "response_parse_failed": "Response parse failed",
+    "schema_validation_failed": "Schema validation failed",
+    "evidence_validation_failed": "Evidence validation failed",
+    "completed_with_evidence_mismatch": "Completed with evidence mismatch",
+    "context_limit_exceeded": "Context limit exceeded",
+    "provider_context_incompatible": "Provider context incompatible",
+    "wiki_completed": "Wiki completed",
+    "wiki_completed_with_warnings": "Wiki completed with warnings",
+    "wiki_empty_response": "Wiki empty response",
+    "wiki_parse_failed": "Wiki parse failed",
+    "wiki_schema_validation_failed": "Wiki schema validation failed",
+    "wiki_provider_timeout": "Wiki provider timed out",
+    "wiki_provider_unavailable": "Wiki provider unavailable",
 }
 
 
@@ -102,6 +121,8 @@ class WikiEntryPoint(BaseModel):
     end_line: int
     description: str
     chunk_id: Optional[str] = None
+    source_reference_status: str = "unvalidated"
+    source_reference_status: str = "unvalidated"
 
 
 class WikiACRow(BaseModel):
@@ -112,6 +133,10 @@ class WikiACRow(BaseModel):
     file_path: str
     start_line: Optional[int] = None
     chunk_id: Optional[str] = None
+    end_line: Optional[int] = None
+    source_reference_status: str = "unvalidated"
+    end_line: Optional[int] = None
+    source_reference_status: str = "unvalidated"
 
 
 class WikiHelper(BaseModel):
@@ -121,6 +146,12 @@ class WikiHelper(BaseModel):
     file_path: str
     role: str
     chunk_id: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    source_reference_status: str = "unvalidated"
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    source_reference_status: str = "unvalidated"
 
 
 class WikiRequirementTrace(BaseModel):
@@ -130,6 +161,12 @@ class WikiRequirementTrace(BaseModel):
     code_reference: str
     file_path: Optional[str] = None
     chunk_id: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    source_reference_status: str = "unvalidated"
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    source_reference_status: str = "unvalidated"
 
 
 class SecurityWikiSchema(BaseModel):
@@ -148,6 +185,7 @@ class CompareRequest(BaseModel):
     question: str
     providers: list[str] = Field(default_factory=lambda: ["ollama"])
     module_id: str | None = None
+    provider_models: dict[str, str] | None = None
 
 
 class VerificationRequest(BaseModel):
@@ -157,13 +195,21 @@ class VerificationRequest(BaseModel):
     human_comment: str | None = None
 
 
+class RunPurposeRequest(BaseModel):
+    run_purpose: Literal["development", "diagnostic", "formal_evaluation"]
+    question_id: str | None = None
+
+
 class EvaluationScoreRequest(BaseModel):
-    correctness: int | None = Field(default=None, ge=0, le=2)
-    evidence_quality: int | None = Field(default=None, ge=0, le=2)
+    correctness: int | None = Field(default=None, ge=0, le=3)
+    evidence_discipline: int | None = Field(default=None, ge=0, le=3)
+    source_reference_accuracy: int | None = Field(default=None, ge=0, le=2)
+    verdict: Literal["Verified", "Incomplete", "Incorrect", "Needs Review"] | None = None
+    evidence_quality: int | None = Field(default=None, exclude=True)
     hallucination: bool | None = None
     notes: str | None = None
-    correct_file_path: int | None = Field(default=None, ge=0, le=2)
-    correct_code_block: int | None = Field(default=None, ge=0, le=2)
+    correct_file_path: int | None = Field(default=None, exclude=True)
+    correct_code_block: int | None = Field(default=None, exclude=True)
     explanation_quality: int | None = Field(default=None, ge=0, le=3)
     completeness: int | None = Field(default=None, ge=0, le=3)
     hallucination_flag: bool | None = None
