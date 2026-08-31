@@ -7,6 +7,7 @@ export type Project = {
   repo_url?: string | null;
   local_path: string;
   subfolder_path?: string | null;
+  android_case_study?: string | null;
   commit_hash?: string | null;
   status: string;
   status_message?: string | null;

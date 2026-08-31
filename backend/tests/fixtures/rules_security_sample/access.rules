@@ -1,0 +1,18 @@
+rules_version = '2';
+
+service cloud.example {
+  match /resources/{resourceId} {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwnerOrMember() {
+      return resource.data.ownerId == request.auth.uid
+        || request.auth.uid in resource.data.memberIds;
+    }
+
+    allow read: if isAuthenticated() && isOwnerOrMember();
+    allow write: if isAuthenticated()
+      && resource.data.ownerId == request.auth.uid;
+  }
+}

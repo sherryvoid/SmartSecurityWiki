@@ -16,6 +16,7 @@ import ast as python_ast
 import hashlib
 import logging
 import re
+from xml.parsers import expat
 from dataclasses import dataclass
 
 from app.services.security_detection import detect_security_tags
@@ -122,7 +123,15 @@ def chunk_source(file_path: str, language: str, code: str) -> list[Chunk]:
         chunks = _chunk_symbols(file_path, language, code)
         if chunks:
             return chunks
-    if language in {"csharp", "kotlin", "rust"}:
+    if language == "xml" and file_path.replace("\\", "/").rsplit("/", 1)[-1].lower() == "androidmanifest.xml":
+        chunks = _chunk_android_manifest(file_path, code)
+        if chunks:
+            return chunks
+    if language == "kotlin":
+        chunks = _chunk_kotlin_tree_sitter(file_path, language, code)
+        if chunks:
+            return chunks
+    if language in {"csharp", "rust"}:
         chunks = _chunk_symbols(file_path, language, code)
         if chunks:
             return chunks
@@ -322,6 +331,117 @@ def _fallback_chunks(file_path: str, code: str, language: str = "unknown", size:
     return chunks or [_make_chunk(file_path, language, "line_range_fallback", None, None, 1, 1, "")]
 
 
+ANDROID_XML_NAMESPACE = "http://schemas.android.com/apk/res/android"
+ANDROID_MANIFEST_ELEMENTS = {
+    "manifest",
+    "uses-permission",
+    "permission",
+    "uses-feature",
+    "application",
+    "activity",
+    "activity-alias",
+    "service",
+    "receiver",
+    "provider",
+}
+ANDROID_COMPONENT_ELEMENTS = {"activity", "activity-alias", "service", "receiver", "provider"}
+
+
+def _chunk_android_manifest(file_path: str, code: str) -> list[Chunk]:
+    lines = code.splitlines()
+    records: list[dict] = []
+    stack: list[dict] = []
+    parser = expat.ParserCreate(namespace_separator="}")
+
+    def start_element(qualified_name: str, attributes: dict[str, str]) -> None:
+        local_name = _xml_local_name(qualified_name)
+        start_line = parser.CurrentLineNumber
+        stack.append(
+            {
+                "name": local_name,
+                "attributes": dict(attributes),
+                "start_line": start_line,
+                "opening_end_line": _xml_opening_tag_end_line(lines, start_line),
+            }
+        )
+
+    def end_element(_qualified_name: str) -> None:
+        if not stack:
+            return
+        element = stack.pop()
+        element["end_line"] = parser.CurrentLineNumber
+        if element["name"] in ANDROID_MANIFEST_ELEMENTS:
+            records.append(element)
+
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
+    try:
+        parser.Parse(code, True)
+    except (expat.ExpatError, ValueError) as exc:
+        logger.warning("AndroidManifest XML parse failed for %s; falling back to line chunks: %s", file_path, exc)
+        return []
+
+    chunks: list[Chunk] = []
+    for element in records:
+        element_name = element["name"]
+        attributes = element["attributes"]
+        start_line = element["start_line"]
+        end_line = element["end_line"] if element_name in ANDROID_COMPONENT_ELEMENTS else element["opening_end_line"]
+        symbol = _android_manifest_symbol(element_name, attributes)
+        chunk_type = (
+            "xml_component"
+            if element_name in ANDROID_COMPONENT_ELEMENTS
+            else "xml_permission"
+            if element_name in {"uses-permission", "permission"}
+            else "xml_manifest"
+            if element_name == "manifest"
+            else "xml_element"
+        )
+        chunks.append(_line_chunk(file_path, "xml", chunk_type, symbol, None, start_line, end_line, lines))
+    return _dedupe_chunks(sorted(chunks, key=lambda chunk: (chunk.start_line, chunk.end_line, chunk.symbol or "")))
+
+
+def _xml_local_name(qualified_name: str) -> str:
+    return qualified_name.rsplit("}", 1)[-1].split(":", 1)[-1]
+
+
+def _android_xml_attribute(attributes: dict[str, str], local_name: str) -> str | None:
+    namespaced = f"{ANDROID_XML_NAMESPACE}}}{local_name}"
+    if namespaced in attributes:
+        return attributes[namespaced]
+    for name, value in attributes.items():
+        if _xml_local_name(name) == local_name and (
+            name.startswith(f"{ANDROID_XML_NAMESPACE}}}") or name.startswith("android:")
+        ):
+            return value
+    return None
+
+
+def _android_manifest_symbol(element_name: str, attributes: dict[str, str]) -> str:
+    if element_name == "manifest":
+        value = attributes.get("package")
+    elif element_name == "application":
+        value = _android_xml_attribute(attributes, "name")
+    else:
+        value = _android_xml_attribute(attributes, "name")
+    return f"{element_name}:{value}" if value else element_name
+
+
+def _xml_opening_tag_end_line(lines: list[str], start_line: int) -> int:
+    quote: str | None = None
+    for line_number in range(start_line, len(lines) + 1):
+        for character in lines[line_number - 1]:
+            if quote:
+                if character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'"}:
+                quote = character
+            elif character == ">":
+                return line_number
+    return start_line
+
+
 def _chunk_markdown(file_path: str, code: str) -> list[Chunk]:
     lines = code.splitlines()
     headings = [index for index, line in enumerate(lines, start=1) if line.startswith("#")]
@@ -435,6 +555,77 @@ def _chunk_go_tree_sitter(file_path: str, language: str, code: str) -> list[Chun
     except Exception as exc:
         logger.warning("Tree-sitter Go parse failed for %s; falling back to regex parser: %s", file_path, exc)
         return []
+
+
+KOTLIN_TYPE_NODE_TYPES = {"class_declaration", "object_declaration", "companion_object"}
+
+
+def _chunk_kotlin_tree_sitter(file_path: str, language: str, code: str) -> list[Chunk]:
+    try:
+        from tree_sitter import Language, Parser
+        import tree_sitter_kotlin as tskotlin
+
+        parser = Parser()
+        parser.language = Language(tskotlin.language())
+        source_bytes = code.encode("utf-8")
+        tree = parser.parse(source_bytes)
+        lines = code.splitlines()
+        chunks: list[Chunk] = []
+
+        for node in _walk_tree_sitter(tree.root_node):
+            if node.type in KOTLIN_TYPE_NODE_TYPES:
+                type_name = _kotlin_type_name(node, source_bytes)
+                if not type_name:
+                    continue
+                declaration = _tree_sitter_node_text(node, source_bytes) or ""
+                chunk_type = "object" if node.type in {"object_declaration", "companion_object"} else "interface" if re.match(r"\s*(?:[\w@().,<>]+\s+)*interface\b", declaration) else "class"
+                chunks.append(_node_chunk(file_path, language, chunk_type, type_name, type_name, node, source_bytes, lines))
+                continue
+
+            if node.type == "function_declaration":
+                name = _tree_sitter_node_text(node.child_by_field_name("name"), source_bytes)
+                if not name:
+                    name = _tree_sitter_node_text(_named_child(node, "identifier"), source_bytes)
+                if not name:
+                    continue
+                enclosing = _kotlin_containing_type(node, source_bytes)
+                chunks.append(_node_chunk(file_path, language, "function", name, enclosing, node, source_bytes, lines))
+                continue
+
+            if node.type in {"primary_constructor", "secondary_constructor"}:
+                containing_node = _kotlin_containing_type_node(node)
+                containing_name = _kotlin_type_name(containing_node, source_bytes)
+                if containing_name:
+                    chunks.append(_node_chunk(file_path, language, "constructor", containing_name, containing_name, node, source_bytes, lines))
+
+        return _dedupe_chunks(sorted(chunks, key=lambda chunk: (chunk.start_line, chunk.end_line, chunk.chunk_type)))
+    except Exception as exc:
+        logger.warning("Tree-sitter Kotlin parse failed for %s; falling back to line chunks: %s", file_path, exc)
+        return []
+
+
+def _kotlin_containing_type(node, source_bytes: bytes) -> str | None:
+    return _kotlin_type_name(_kotlin_containing_type_node(node), source_bytes)
+
+
+def _kotlin_containing_type_node(node):
+    current = node.parent
+    while current is not None:
+        if current.type in KOTLIN_TYPE_NODE_TYPES:
+            return current
+        current = current.parent
+    return None
+
+
+def _kotlin_type_name(node, source_bytes: bytes) -> str | None:
+    if node is None:
+        return None
+    name = _tree_sitter_node_text(node.child_by_field_name("name"), source_bytes)
+    if name:
+        return name
+    if node.type == "companion_object":
+        return "Companion"
+    return _tree_sitter_node_text(_named_child(node, "identifier"), source_bytes)
 
 
 def _walk_tree_sitter(node):

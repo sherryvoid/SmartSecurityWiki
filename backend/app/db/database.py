@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS projects (
     repo_url TEXT,
     local_path TEXT NOT NULL,
     subfolder_path TEXT,
+    android_case_study TEXT,
     commit_hash TEXT,
     status TEXT NOT NULL,
     status_message TEXT,
@@ -205,6 +206,7 @@ def init_db() -> None:
         _ensure_column(connection, "chat_messages", "raw_model_response", "TEXT")
         _ensure_column(connection, "wiki_pages", "wiki_schema_version", "TEXT DEFAULT '1.0'")
         _ensure_column(connection, "projects", "subfolder_path", "TEXT")
+        _ensure_column(connection, "projects", "android_case_study", "TEXT")
         _ensure_column(connection, "projects", "progress_percent", "INTEGER")
         _ensure_column(connection, "projects", "files_indexed", "INTEGER DEFAULT 0")
         _ensure_column(connection, "projects", "total_files", "INTEGER DEFAULT 0")
@@ -235,6 +237,9 @@ def init_db() -> None:
         _ensure_column(connection, "evaluations", "verdict", "TEXT")
         _ensure_column(connection, "evaluations", "evaluation_config_hash", "TEXT")
         _ensure_column(connection, "evaluations", "evaluation_type", "TEXT DEFAULT 'model'")
+        _ensure_column(connection, "evaluations", "evaluated_at", "TEXT")
+        _ensure_column(connection, "formal_runs", "started_at", "TEXT")
+        _ensure_column(connection, "formal_runs", "completed_at", "TEXT")
         _ensure_column(connection, "formal_runs", "supplied_source_evidence_json", "TEXT")
         _ensure_column(connection, "formal_runs", "cited_source_evidence_json", "TEXT")
         _ensure_column(connection, "formal_runs", "supplied_source_package_hash", "TEXT")

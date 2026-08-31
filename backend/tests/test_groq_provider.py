@@ -115,6 +115,32 @@ def test_groq_safe_error_categories(monkeypatch):
     assert timed_out["content"] == "Groq did not complete within the configured timeout."
 
 
+def test_groq_token_capacity_error_is_safely_preserved(monkeypatch):
+    from app.core.config import Settings
+    from app.services.llm import GroqProvider
+
+    secret = "private-org-and-key-value"
+    response = httpx.Response(
+        413,
+        json={"error": {"type": "tokens", "code": "rate_limit_exceeded", "message": "Token limit reached; retry later."}, "organization": secret},
+        headers={"x-request-id": "req-safe", "retry-after": "57", "x-ratelimit-limit-tokens": "8000", "x-ratelimit-remaining-tokens": "0", "x-private-org": secret},
+        request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _Client(response=response))
+    settings = Settings(_env_file=None, groq_api_key=secret)
+    result = asyncio.run(GroqProvider(settings).generate([], settings.groq_default_model))
+
+    assert result["raw"] == {
+        "error": "provider_error", "category": "rate_limit", "status_code": 413,
+        "provider_error_type": "tokens", "provider_error_code": "rate_limit_exceeded",
+        "provider_message": "Token limit reached; retry later.", "request_id": "req-safe",
+        "retry_after": "57", "rate_limit_tokens": "8000", "rate_limit_remaining_tokens": "0",
+    }
+    assert result["error"]["error_code"] == "GROQ_RATE_LIMIT"
+    assert result["error"]["retryable"] is True
+    assert secret not in repr(result)
+
+
 def test_compare_groq_gets_frozen_evidence_and_preserves_full_answer(isolated_env, monkeypatch):
     import json
     from app.db.database import init_db

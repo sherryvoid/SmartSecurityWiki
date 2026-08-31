@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Literal
@@ -439,12 +440,41 @@ SECURITY_QUERY_EXPANSIONS = {
 }
 
 
+MANIFEST_COMPONENT_TERMS = re.compile(
+    r"\b(?:android\s+components?|manifest\s+components?|components?|activities?|services?|"
+    r"(?:broadcast\s+)?receivers?|(?:content\s+)?providers?|activity\s+aliases?)\b",
+    re.IGNORECASE,
+)
+MANIFEST_COMPONENT_CONTEXT = re.compile(
+    r"\b(?:android|manifest|exported?|externally|external\s+apps?|component[- ]level|"
+    r"android:exported|android:permission|readpermission|writepermission|intent[- ]filter)\b",
+    re.IGNORECASE,
+)
+BINDER_RUNTIME_CONTEXT = re.compile(
+    r"\b(?:binder|getcallinguid|calling\s+uid|ipc|enforcepermission|checkpermission)\b",
+    re.IGNORECASE,
+)
+
+
+def has_manifest_component_intent(query: str) -> bool:
+    """Identify manifest declaration questions without matching generic service prose."""
+    return bool(MANIFEST_COMPONENT_TERMS.search(query) and MANIFEST_COMPONENT_CONTEXT.search(query))
+
+
 def expand_security_query(query: str) -> str:
     q_lower = query.lower()
+    if has_manifest_component_intent(query):
+        manifest_terms = [
+            "AndroidManifest", "manifest component", "activity", "service", "receiver", "provider",
+            "android:exported", "android:permission readPermission writePermission",
+        ]
+        return query + " " + " ".join(manifest_terms)
     expansions = []
     for keyword, synonyms in SECURITY_QUERY_EXPANSIONS.items():
         if keyword.lower() in q_lower:
             expansions.extend(synonyms[:3])
+    if BINDER_RUNTIME_CONTEXT.search(query):
+        expansions.extend(SECURITY_QUERY_EXPANSIONS["android"][:3])
     if not expansions:
         return query
     seen = []

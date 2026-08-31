@@ -1,0 +1,5 @@
+policy version 1
+
+permit read when isSignedIn()
+permit update when hasEditorRole()
+deny delete unless isAdministrator()

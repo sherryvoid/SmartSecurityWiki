@@ -1,0 +1,5 @@
+class WorkspaceSummary {
+  val owner = "Account owner"
+  val member = "Workspace member"
+  val actions = listOf("create", "read", "update", "delete")
+}

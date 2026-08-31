@@ -1,0 +1,5 @@
+Create workspace
+Read household summary
+Update member
+Delete account
+Allow owner notifications

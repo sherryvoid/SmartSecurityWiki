@@ -14,7 +14,7 @@ from app.db.schemas import (
     VerificationRequest,
     WikiGenerateRequest,
 )
-from app.services.audit_service import chat, compare_models, delete_wiki_page, export_project, generate_wiki, list_wiki_pages, score_evaluation, verify
+from app.services.audit_service import chat, compare_models, delete_wiki_page, export_project, generate_wiki, get_evaluation, list_wiki_pages, score_evaluation, verify
 from app.services.project_service import (
     ANDROID_CASE_STUDIES,
     create_project,
@@ -158,7 +158,18 @@ def verification(project_id: str, request: VerificationRequest) -> dict:
 
 @router.patch("/{project_id}/evaluations/{evaluation_id}")
 def evaluation_score(project_id: str, evaluation_id: str, request: EvaluationScoreRequest) -> dict:
-    return score_evaluation(evaluation_id, request)
+    try:
+        return score_evaluation(evaluation_id, request, project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{project_id}/evaluations/{evaluation_id}")
+def evaluation_detail(project_id: str, evaluation_id: str) -> dict:
+    try:
+        return get_evaluation(project_id, evaluation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/{project_id}/formal-runs")
@@ -176,8 +187,8 @@ def run_purpose(project_id: str, run_id: str, request: RunPurposeRequest) -> dic
 
 @router.get("/{project_id}/export")
 def export_query(project_id: str, format: str = "markdown", auditor_name: str = Depends(require_user)) -> Response:
-    if format not in {"markdown", "json", "csv"}:
-        raise HTTPException(status_code=400, detail="Export format must be markdown, json, or csv")
+    if format not in {"markdown", "html", "pdf"}:
+        raise HTTPException(status_code=400, detail="Export format must be pdf, html, or markdown")
     try:
         media_type, filename, content = export_project(project_id, "md" if format == "markdown" else format, auditor_name)
     except ValueError as exc:
@@ -187,8 +198,8 @@ def export_query(project_id: str, format: str = "markdown", auditor_name: str = 
 
 @router.get("/{project_id}/export/{export_format}")
 def export(project_id: str, export_format: str, auditor_name: str = Depends(require_user)) -> Response:
-    if export_format not in {"markdown", "json", "csv", "pdf"}:
-        raise HTTPException(status_code=400, detail="Export format must be markdown, json, csv, or pdf")
+    if export_format not in {"markdown", "html", "pdf"}:
+        raise HTTPException(status_code=400, detail="Export format must be pdf, html, or markdown")
     try:
         media_type, filename, content = export_project(project_id, "md" if export_format == "markdown" else export_format, auditor_name)
     except ValueError as exc:

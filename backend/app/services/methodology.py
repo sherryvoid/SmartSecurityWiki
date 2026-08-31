@@ -16,15 +16,25 @@ def canonical_hash(value) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def normalize_presentation_text_items(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item is not None and str(item).strip()]
+    return [str(value)]
+
+
 def render_structured_answer_payload(payload: dict) -> str:
     """Lossless human-readable projection of every substantive structured answer field."""
     sections = [str(payload.get("answer") or "").strip()]
     if payload.get("access_control_summary"):
         sections.append("## Access-control summary\n\n" + str(payload["access_control_summary"]).strip())
-    helper_chain = payload.get("helper_chain") or []
+    helper_chain = normalize_presentation_text_items(payload.get("helper_chain"))
     if helper_chain:
         sections.append("## Helper chain\n\n" + "\n".join(f"{index}. {item}" for index, item in enumerate(helper_chain, 1)))
-    limitations = payload.get("limitations") or []
+    limitations = normalize_presentation_text_items(payload.get("limitations"))
     if limitations:
         sections.append("## Limitations\n\n" + "\n".join(f"- {item}" for item in limitations))
     return "\n\n".join(section for section in sections if section)
@@ -53,6 +63,10 @@ def evaluation_configuration(project_id: str, models: list[dict] | None = None) 
                 item.update({"reasoning": "enabled" if settings.ollama_think_enabled else "disabled", "temperature": 0.1, "top_p": None, "num_predict": settings.ollama_num_predict, "context_length": settings.ollama_context_length, "timeout_seconds": settings.ollama_timeout_seconds, "inference_options": {"think": settings.ollama_think_enabled}})
             elif item.get("provider") == "groq":
                 item.update({"reasoning_effort": settings.groq_reasoning_effort or "provider_default", "reasoning_format": settings.groq_reasoning_format, "include_reasoning": settings.groq_include_reasoning, "temperature": "provider_default", "max_output_tokens": settings.groq_max_output_tokens, "timeout_seconds": settings.groq_timeout_seconds, "base_url": settings.groq_base_url})
+            elif item.get("provider") == "openrouter":
+                item.update({"temperature": 0.1, "max_output_tokens": settings.openrouter_max_output_tokens, "timeout_seconds": settings.openrouter_timeout_seconds, "base_url": settings.openrouter_base_url, "deployment_route": f"{settings.openrouter_model} accessed through OpenRouter"})
+                if str(item.get("model") or "").lower() in {"openai/gpt-5.1", "gpt-5.1"}:
+                    item["presentation_prompt_version"] = settings.gpt51_presentation_version
             selected_models.append(item)
     config = {
         "revision": settings.evaluation_config_revision,
@@ -71,7 +85,7 @@ def evaluation_configuration(project_id: str, models: list[dict] | None = None) 
         "ollama_think_flag": settings.ollama_think_enabled,
         "ollama_num_predict": settings.ollama_num_predict,
         "generation_parameters": {"temperature": 0.1},
-        "timeouts_seconds": {"ollama": settings.ollama_timeout_seconds, "openai": settings.openai_timeout_seconds, "gemini": settings.gemini_timeout_seconds},
+        "timeouts_seconds": {"ollama": settings.ollama_timeout_seconds, "openai": settings.openai_timeout_seconds, "gemini": settings.gemini_timeout_seconds, "openrouter": settings.openrouter_timeout_seconds},
         "compare_source_limit": settings.compare_source_chunk_limit,
         "retrieval_scoring_configuration": "hybrid-vector-lexical-rescore-v4.4",
     }
@@ -197,8 +211,8 @@ def _common_prefix(left: str, right: str) -> str:
 def persist_formal_run(record: dict) -> str:
     run_id = record.get("run_id") or str(uuid.uuid4())
     with db() as connection:
-        connection.execute("INSERT OR REPLACE INTO formal_runs (run_id, project_id, operation, question, timestamp, provider_model_json, answer_json, primary_evidence_json, wiki_context_json, execution_status, comparison_metadata_json, evaluation_config_hash, human_evaluation_id, human_evaluation_status, supplied_source_evidence_json, cited_source_evidence_json, supplied_source_package_hash, supplied_wiki_package_hash, evaluation_config_json,run_purpose,question_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
-            run_id, record["project_id"], record["operation"], record.get("question", ""), record.get("timestamp") or now(), json.dumps(record.get("provider_model")), json.dumps(record.get("answer")), json.dumps(record.get("cited_source_evidence", record.get("primary_evidence", []))), json.dumps(record.get("wiki_context", [])), record.get("execution_status"), json.dumps(record.get("comparison_metadata", {})), record.get("evaluation_config_hash"), record.get("human_evaluation_id"), record.get("human_evaluation_status", "not_scored"), json.dumps(record.get("supplied_source_evidence", record.get("primary_evidence", []))), json.dumps(record.get("cited_source_evidence", record.get("primary_evidence", []))), record.get("supplied_source_package_hash"), record.get("supplied_wiki_package_hash"), json.dumps(record.get("evaluation_config", {})),record.get("run_purpose","development"),record.get("question_id")))
+        connection.execute("INSERT OR REPLACE INTO formal_runs (run_id, project_id, operation, question, timestamp, provider_model_json, answer_json, primary_evidence_json, wiki_context_json, execution_status, comparison_metadata_json, evaluation_config_hash, human_evaluation_id, human_evaluation_status, supplied_source_evidence_json, cited_source_evidence_json, supplied_source_package_hash, supplied_wiki_package_hash, evaluation_config_json,run_purpose,question_id,started_at,completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+            run_id, record["project_id"], record["operation"], record.get("question", ""), record.get("timestamp") or now(), json.dumps(record.get("provider_model")), json.dumps(record.get("answer")), json.dumps(record.get("cited_source_evidence", record.get("primary_evidence", []))), json.dumps(record.get("wiki_context", [])), record.get("execution_status"), json.dumps(record.get("comparison_metadata", {})), record.get("evaluation_config_hash"), record.get("human_evaluation_id"), record.get("human_evaluation_status", "not_scored"), json.dumps(record.get("supplied_source_evidence", record.get("primary_evidence", []))), json.dumps(record.get("cited_source_evidence", record.get("primary_evidence", []))), record.get("supplied_source_package_hash"), record.get("supplied_wiki_package_hash"), json.dumps(record.get("evaluation_config", {})),record.get("run_purpose","development"),record.get("question_id"),record.get("started_at"),record.get("completed_at")))
     return run_id
 
 

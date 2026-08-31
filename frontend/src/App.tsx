@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 import { LogOut } from "lucide-react";
 import { clearToken, getToken } from "./services/api";
@@ -22,10 +22,10 @@ export default function App() {
     <div className="app-shell">
       {getToken() && !location.pathname.startsWith("/projects/") && (
         <header className="topbar">
-          <div>
+          <Link className="topbar-brand" to="/" aria-label="Security CodeWiki home">
             <strong>Security CodeWiki</strong>
             <span>Create or open a project</span>
-          </div>
+          </Link>
           <button className="icon-button" aria-label="Log out" onClick={logout} title="Log out">
             <LogOut size={18} />
           </button>

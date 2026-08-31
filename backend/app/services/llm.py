@@ -1,6 +1,7 @@
 # READ SUMMARY: This module wraps LLM providers and structured Security Wiki response validation.
 # CHANGED: Added provider availability checks plus per-provider timeout handling that returns structured graceful timeout responses.
 import json
+import math
 import re
 
 import httpx
@@ -21,6 +22,88 @@ class LLMProvider:
 
     async def generate(self, messages: list[dict], model: str, temperature: float = 0.1, **kwargs) -> dict:
         raise NotImplementedError
+
+
+PROMPT_TOKEN_ESTIMATE_SAFETY_FACTOR = 1.10
+
+
+def prompt_fit_preflight(provider: LLMProvider, messages: list[dict], model: str) -> dict:
+    """Check a configured provider context before making a model request.
+
+    Ollama does not expose a stable tokenize-only endpoint in the supported API.
+    A provider may supply ``count_prompt_tokens`` for an exact count; otherwise
+    the check uses the existing four-characters-per-token estimate with a 10%
+    safety margin and small chat-envelope allowance.
+    """
+    provider_name = getattr(provider, "name", "unknown").lower()
+    if provider_name != "ollama":
+        return {
+            "applicable": False,
+            "passed": True,
+            "provider": provider_name,
+            "model": model,
+            "count_type": "provider_capacity_not_configured",
+        }
+
+    settings = getattr(provider, "settings", None) or get_settings()
+    serialized = "\n".join(str(message.get("content", "")) for message in messages)
+    counter = getattr(provider, "count_prompt_tokens", None)
+    prompt_tokens = None
+    count_type = "conservative_estimate"
+    if callable(counter):
+        try:
+            counted = counter(messages, model)
+            if isinstance(counted, int) and counted >= 0:
+                prompt_tokens = counted
+                count_type = "exact"
+        except Exception:
+            prompt_tokens = None
+    if prompt_tokens is None:
+        base_estimate = math.ceil(len(serialized) / 4) if serialized else 0
+        prompt_tokens = math.ceil(base_estimate * PROMPT_TOKEN_ESTIMATE_SAFETY_FACTOR) + (4 * len(messages))
+
+    configured_context = int(settings.ollama_context_length)
+    reserved_output_tokens = int(settings.ollama_num_predict)
+    required_total = prompt_tokens + reserved_output_tokens
+    return {
+        "applicable": True,
+        "passed": required_total <= configured_context,
+        "provider": provider_name,
+        "model": model,
+        "configured_context": configured_context,
+        "prompt_tokens": prompt_tokens,
+        "count_type": count_type,
+        "reserved_output_tokens": reserved_output_tokens,
+        "required_total_tokens": required_total,
+        "estimate_safety_factor": PROMPT_TOKEN_ESTIMATE_SAFETY_FACTOR if count_type == "conservative_estimate" else None,
+    }
+
+
+def context_incompatible_response(preflight: dict) -> dict:
+    return {
+        "content": "The provider was not called because the complete prompt and reserved output do not fit its configured context.",
+        "validation_status": "provider_context_incompatible",
+        "ok": False,
+        "raw": {"error": "provider_context_incompatible"},
+        "error": {
+            "error_code": "PROVIDER_CONTEXT_INCOMPATIBLE",
+            "user_message": "The complete evidence package does not fit this provider's configured context.",
+            "technical_message": None,
+            "retryable": False,
+            "provider": preflight.get("provider"),
+            "model": preflight.get("model"),
+        },
+        "diagnostics": {
+            "prompt_fit": preflight,
+            "processing": {
+                "response_received": False,
+                "content_present": False,
+                "parse_status": "not_called_context_incompatible",
+                "schema_validation_status": "not_run",
+                "evidence_validation_status": "intended_evidence_not_evaluated",
+            },
+        },
+    }
 
 SIMPLE_PROMPT_TEMPLATE = """You are a security code auditor.
 Answer using ONLY the source code evidence provided below.
@@ -61,7 +144,7 @@ def sanitize_diagnostic_text(value: object, max_chars: int) -> str:
     return text
 
 
-def is_provider_available(provider: str) -> bool:
+def is_provider_available(provider: str, model: str | None = None) -> bool:
     """
     Return True only when the provider can actually be called.
 
@@ -76,11 +159,20 @@ def is_provider_available(provider: str) -> bool:
         return bool(settings.openai_api_key.strip())
     if provider == "groq":
         return bool(settings.groq_api_key.strip())
+    if provider == "openrouter":
+        return bool(settings.openrouter_api_key.strip())
     if provider == "ollama":
         try:
             url = settings.ollama_base_url.rstrip("/")
             response = httpx.get(f"{url}/api/tags", timeout=3.0)
-            return response.status_code < 500
+            if response.status_code >= 400:
+                return False
+            configured_model = model or settings.ollama_default_model
+            installed = {
+                item.get("name") for item in response.json().get("models", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            return configured_model in installed
         except Exception:
             return False
     return False
@@ -252,8 +344,10 @@ class OpenAIProvider(LLMProvider):
             return {"content": content, "raw": data, "usage": data.get("usage") or {}, "ok": True, "diagnostics": _cloud_processing_diagnostics(content)}
         except httpx.TimeoutException:
             return provider_timeout_response("OpenAI", self.settings.openai_timeout_seconds)
-        except httpx.HTTPError as exc:
-            return provider_error_response("OpenAI", str(exc))
+        except httpx.HTTPStatusError as exc:
+            return cloud_http_error_response("OpenAI", exc.response.status_code)
+        except httpx.HTTPError:
+            return cloud_http_error_response("OpenAI", None)
 
 
 class GeminiProvider(LLMProvider):
@@ -277,8 +371,10 @@ class GeminiProvider(LLMProvider):
             return {"content": content, "raw": data, "usage": data.get("usageMetadata") or {}, "ok": True, "diagnostics": _cloud_processing_diagnostics(content)}
         except httpx.TimeoutException:
             return provider_timeout_response("Gemini", self.settings.gemini_timeout_seconds)
-        except httpx.HTTPError as exc:
-            return provider_error_response("Gemini", str(exc))
+        except httpx.HTTPStatusError as exc:
+            return cloud_http_error_response("Gemini", exc.response.status_code)
+        except httpx.HTTPError:
+            return cloud_http_error_response("Gemini", None)
 
 
 class GroqProvider(LLMProvider):
@@ -320,17 +416,57 @@ class GroqProvider(LLMProvider):
             return result
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            provider_details = _groq_http_error_details(exc.response)
             if status == 401:
-                return groq_error_response("authentication", "Groq authentication failed. Check GROQ_API_KEY.", status)
-            if status == 429:
-                return groq_error_response("rate_limit", "Groq rate limit reached. Try again after the provider retry window.", status)
+                return groq_error_response("authentication", "Groq authentication failed. Check GROQ_API_KEY.", status, provider_details)
+            if status == 429 or provider_details.get("provider_error_code") == "rate_limit_exceeded" or provider_details.get("provider_error_type") == "tokens":
+                return groq_error_response("rate_limit", "Groq rate or capacity limit reached. Try again after the provider retry window or use a higher provider limit.", status, provider_details)
             if status in {400, 404} and "model" in exc.response.text.lower():
-                return groq_error_response("model_unavailable", "The selected Groq model is currently unavailable.", status)
-            return groq_error_response("provider", "Groq could not complete the request.", status)
+                return groq_error_response("model_unavailable", "The selected Groq model is currently unavailable.", status, provider_details)
+            return groq_error_response("provider", "Groq could not complete the request.", status, provider_details)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return groq_error_response("malformed", "Groq returned a response SecurityCodeWiki could not process.")
         except httpx.HTTPError:
             return groq_error_response("provider", "Groq could not complete the request.")
+
+
+class OpenRouterProvider(LLMProvider):
+    name = "openrouter"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    async def generate(self, messages: list[dict], model: str, temperature: float = 0.1, **kwargs) -> dict:
+        if not self.settings.openrouter_api_key:
+            return missing_key_response("OpenRouter")
+        payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": self.settings.openrouter_max_output_tokens}
+        headers = {"Authorization": f"Bearer {self.settings.openrouter_api_key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.openrouter_timeout_seconds) as client:
+                response = await client.post(f"{self.settings.openrouter_base_url.rstrip('/')}/chat/completions", headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+            choices = data.get("choices") or []
+            content = choices[0].get("message", {}).get("content", "") if choices else ""
+            if not isinstance(content, str) or not content.strip():
+                return openrouter_error_response("malformed", "OpenRouter returned a response SecurityCodeWiki could not process.")
+            return {"content": content, "raw": {"id": data.get("id"), "model": data.get("model"), "provider": data.get("provider")}, "usage": data.get("usage") or {}, "ok": True, "diagnostics": {**_cloud_processing_diagnostics(content), "envelope": {"max_output_tokens": self.settings.openrouter_max_output_tokens, "deployment_route": "OpenRouter"}}}
+        except httpx.TimeoutException:
+            result = provider_timeout_response("OpenRouter", self.settings.openrouter_timeout_seconds)
+            result["content"] = f"{model} through OpenRouter did not complete within the configured timeout."
+            return result
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            details = _groq_http_error_details(exc.response)
+            if status in {401, 403}:
+                return openrouter_error_response("authentication", "OpenRouter authentication failed. Check the server configuration.", status, details)
+            if status == 429:
+                return openrouter_error_response("rate_limit", "OpenRouter rate or capacity limit reached. Try again after the provider retry window.", status, details)
+            return openrouter_error_response("provider", "OpenRouter could not complete the request.", status, details)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return openrouter_error_response("malformed", "OpenRouter returned a response SecurityCodeWiki could not process.")
+        except httpx.HTTPError:
+            return openrouter_error_response("provider", "OpenRouter could not complete the request.")
 
 
 def _cloud_processing_diagnostics(content: str) -> dict:
@@ -339,8 +475,16 @@ def _cloud_processing_diagnostics(content: str) -> dict:
 
 def missing_key_response(provider: str) -> dict:
     return {
-        "content": f"{provider} API key is not configured. Not verified from the available evidence.",
+        "content": f"{provider} is not configured because its API key is missing.",
         "raw": {"error": "missing_api_key"},
+        "validation_status": "provider_unavailable",
+        "error": {
+            "error_code": "MISSING_API_KEY",
+            "user_message": f"{provider} is not configured because its API key is missing.",
+            "technical_message": None,
+            "retryable": False,
+            "provider": provider.lower(),
+        },
         "ok": False,
     }
 
@@ -349,6 +493,32 @@ def provider_error_response(provider: str, detail: str) -> dict:
     return {
         "content": f"{provider} provider error: {detail}\n\nNot verified from the available source-code evidence.",
         "raw": {"error": "provider_error", "detail": detail},
+        "ok": False,
+    }
+
+
+def cloud_http_error_response(provider: str, status_code: int | None) -> dict:
+    if status_code in {401, 403}:
+        category, message, retryable = "authentication", f"{provider} authentication failed. Check the server configuration.", False
+    elif status_code == 404:
+        category, message, retryable = "model_unavailable", f"The selected {provider} model or endpoint is unavailable.", False
+    elif status_code == 429:
+        category, message, retryable = "rate_limit", f"{provider} rate or capacity limit reached. Try again later.", True
+    elif status_code is not None and status_code >= 500:
+        category, message, retryable = "provider", f"{provider} is temporarily unavailable.", True
+    else:
+        category, message, retryable = "network", f"{provider} could not be reached.", True
+    return {
+        "content": message,
+        "raw": {"error": "provider_error", "category": category, "status_code": status_code},
+        "validation_status": "provider_unavailable",
+        "error": {
+            "error_code": f"{provider.upper()}_{category.upper()}",
+            "user_message": message,
+            "technical_message": f"HTTP status {status_code}" if status_code is not None else "Network request failed",
+            "retryable": retryable,
+            "provider": provider.lower(),
+        },
         "ok": False,
     }
 
@@ -367,8 +537,47 @@ def provider_timeout_response(provider: str, timeout_seconds: float) -> dict:
     }
 
 
-def groq_error_response(category: str, message: str, status_code: int | None = None) -> dict:
-    return {"content": message, "raw": {"error": "provider_error", "category": category, "status_code": status_code}, "error": {"error_code": f"GROQ_{category.upper()}", "user_message": message, "technical_message": f"Groq HTTP status {status_code}" if status_code else category, "retryable": category in {"rate_limit", "provider"}, "provider": "groq"}, "validation_status": "provider_unavailable", "ok": False}
+def _groq_http_error_details(response: httpx.Response) -> dict:
+    details = {}
+    try:
+        payload = response.json()
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            for source, target in (("type", "provider_error_type"), ("code", "provider_error_code")):
+                value = error.get(source)
+                if isinstance(value, str) and value:
+                    details[target] = value[:100]
+            message = error.get("message")
+            if isinstance(message, str) and message:
+                details["provider_message"] = " ".join(message.split())[:1000]
+    except (ValueError, json.JSONDecodeError):
+        pass
+    for header, target in (
+        ("x-request-id", "request_id"),
+        ("retry-after", "retry_after"),
+        ("x-ratelimit-limit-tokens", "rate_limit_tokens"),
+        ("x-ratelimit-remaining-tokens", "rate_limit_remaining_tokens"),
+    ):
+        value = response.headers.get(header)
+        if value:
+            details[target] = value[:200]
+    return details
+
+
+def groq_error_response(category: str, message: str, status_code: int | None = None, provider_details: dict | None = None) -> dict:
+    safe_details = dict(provider_details or {})
+    raw = {"error": "provider_error", "category": category, "status_code": status_code, **safe_details}
+    technical = f"Groq HTTP status {status_code}" if status_code else category
+    if safe_details.get("provider_error_type") or safe_details.get("provider_error_code"):
+        technical += f" ({safe_details.get('provider_error_type', 'unknown')}/{safe_details.get('provider_error_code', 'unknown')})"
+    return {"content": message, "raw": raw, "error": {"error_code": f"GROQ_{category.upper()}", "user_message": message, "technical_message": technical, "retryable": category in {"rate_limit", "provider"}, "provider": "groq", **safe_details}, "validation_status": "provider_unavailable", "ok": False}
+
+
+def openrouter_error_response(category: str, message: str, status_code: int | None = None, provider_details: dict | None = None) -> dict:
+    safe_details = dict(provider_details or {})
+    raw = {"error": "provider_error", "category": category, "status_code": status_code, **safe_details}
+    technical = f"OpenRouter HTTP status {status_code}" if status_code else category
+    return {"content": message, "raw": raw, "error": {"error_code": f"OPENROUTER_{category.upper()}", "user_message": message, "technical_message": technical, "retryable": category in {"rate_limit", "provider"}, "provider": "openrouter", **safe_details}, "validation_status": "provider_unavailable", "ok": False}
 
 
 def provider_for(name: str, settings: Settings | None = None) -> tuple[LLMProvider, str]:
@@ -378,6 +587,7 @@ def provider_for(name: str, settings: Settings | None = None) -> tuple[LLMProvid
         "openai": (OpenAIProvider(settings), settings.openai_default_model),
         "gemini": (GeminiProvider(settings), settings.resolved_gemini_default_model),
         "groq": (GroqProvider(settings), settings.groq_default_model),
+        "openrouter": (OpenRouterProvider(settings), settings.openrouter_model),
     }
     if name not in providers:
         raise ValueError(f"Provider '{name}' is not active.")
@@ -385,7 +595,7 @@ def provider_for(name: str, settings: Settings | None = None) -> tuple[LLMProvid
 
 
 def active_provider_names() -> tuple[str, ...]:
-    return ("ollama", "openai", "gemini", "groq")
+    return ("ollama", "openai", "gemini", "groq", "openrouter")
 
 
 def security_wiki_system_prompt() -> str:

@@ -19,7 +19,7 @@ The project combines language-aware parsing, local embeddings, hybrid retrieval,
 - Validate evidence references and retain package hashes for reproducible comparisons.
 - Navigate from evidence cards to exact source ranges in the Monaco editor.
 - Review History and provider token, latency, and cost telemetry.
-- Use local Ollama models or optional OpenAI, Gemini, and Groq providers.
+- Use local Ollama models or optional OpenAI, Gemini, Groq, and configurable models accessed through OpenRouter.
 
 ## Architecture
 
@@ -86,12 +86,30 @@ A GPU is not mandatory, but embedding generation and local LLM inference can be 
 
 ## Clean-machine installation
 
+The backend and frontend use different toolchains:
+
+- The backend uses Python dependencies installed in a project-local virtual environment named `.venv`.
+- The frontend uses Node.js dependencies installed in `frontend/node_modules` by npm.
+
+Do not install the backend packages globally. The `.venv` directory keeps this project's Python packages isolated from the rest of the computer.
+
 ```bash
 git clone <YOUR_GITHUB_REPOSITORY_URL>
 cd SecurityWiki
 ```
 
-Create the backend environment from the repository root.
+Check that the required tools are available:
+
+```bash
+git --version
+python --version
+node --version
+npm --version
+```
+
+If Windows opens the Microsoft Store or says Python is unavailable, install a current Python 3 release from [python.org](https://www.python.org/downloads/) or run `winget install --id Python.Python.3.13 -e`. Close and reopen PowerShell after installation, then confirm that `python --version` works.
+
+Create the backend virtual environment from the repository root.
 
 Linux/macOS:
 
@@ -112,6 +130,8 @@ python -m pip install --upgrade pip
 python -m pip install -r backend\requirements.txt
 Copy-Item backend\.env.example backend\.env
 ```
+
+PowerShell may block `Activate.ps1` because of its execution policy. Activation is convenient but not required. You can always run the virtual environment directly with `.\.venv\Scripts\python.exe`, as shown in the Windows run commands below.
 
 Install the frontend with the existing npm lockfile:
 
@@ -154,6 +174,9 @@ Provider settings:
 | `GROQ_BASE_URL` | No | Groq-compatible API endpoint | `https://api.groq.com/openai/v1` |
 | `GROQ_DEFAULT_MODEL` | No | Default Groq model | `openai/gpt-oss-20b` |
 | `GROQ_ACTIVE_MODELS` | No | Comma-separated enabled Groq models | `openai/gpt-oss-20b` |
+| `OPENROUTER_API_KEY` | For OpenRouter | Server-side OpenRouter credential | empty |
+| `OPENROUTER_BASE_URL` | No | OpenRouter-compatible endpoint | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_MODEL` | No | Exact model accessed through OpenRouter | `openai/gpt-5.1` |
 
 The template also documents provider timeouts, Ollama generation settings, repository limits, Wiki context limits, retrieval package sizes, and frozen evaluation identifiers. Keep those values stable when runs need to be comparable.
 
@@ -161,21 +184,63 @@ The frontend development server proxies `/api` to `http://127.0.0.1:8000`. Set `
 
 ## Run the application
 
-Start the backend from `backend/` so default relative storage paths are predictable:
+The application needs two terminals: one for the Python backend and one for the Vite frontend. Keep both terminals running while using the application.
+
+### 1. Start the backend
+
+Start from the repository root, then change to `backend/` so default relative storage paths are predictable.
+
+Linux/macOS, with `.venv` activated:
 
 ```bash
 cd backend
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-In a second terminal:
+Windows PowerShell, without requiring activation:
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Wait until Uvicorn reports that it is running on `http://127.0.0.1:8000`. You can verify the backend by opening `http://127.0.0.1:8000/api/health`.
+
+### 2. Start the frontend
+
+Open a second terminal at the repository root. The first terminal must remain open with the backend running.
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173` and log in with the credentials from `backend/.env`. Backend health is available at `GET http://127.0.0.1:8000/api/health`; model/provider readiness is available at `GET /api/models/health`.
+
+If this is the first frontend run and dependencies have not yet been installed, run `npm ci` before `npm run dev`.
+
+Wait until Vite prints its local URL, normally `http://127.0.0.1:5173` or `http://localhost:5173`. Open that address and log in with the credentials from `backend/.env`.
+
+Backend health is available at `GET http://127.0.0.1:8000/api/health`; model/provider readiness is available at `GET http://127.0.0.1:8000/api/models/health`.
+
+### Starting the application again later
+
+You do not need to reinstall dependencies each time. From the repository root:
+
+Terminal 1 on Windows:
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Terminal 2 on Windows, Linux, or macOS:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Stop either development server by focusing its terminal and pressing `Ctrl+C`.
 
 ## Local Ollama models
 
@@ -190,9 +255,17 @@ The application queries the configured Ollama endpoint and shows locally availab
 
 ## Cloud providers
 
-OpenAI, Gemini, and Groq are implemented as optional backend providers. Put credentials only in `backend/.env`; the browser health endpoint reports availability without returning keys. Provider model availability, pricing, and rate limits are controlled by those services and may change. An HTTP 429 means the provider has temporarily rejected the request because of a quota or rate limit.
+OpenAI, Gemini, Groq, and OpenRouter are implemented as optional backend providers. OpenRouter's model is configured with `OPENROUTER_MODEL`; for example, `openai/gpt-5.1` accesses GPT-5.1 through OpenRouter. Historical runs retain the model that actually executed, including older GPT-4o Mini runs. Put credentials only in `backend/.env`; the browser health endpoint reports availability without returning keys. Provider model availability, pricing, and rate limits are controlled by those services and may change. An HTTP 429 means the provider has temporarily rejected the request because of a quota or capacity limit.
 
 When a cloud model is selected, retrieved repository evidence is sent to that provider. Use local Ollama when repository material must remain on the local machine, subject to the security of the local host and model installation.
+
+## Model availability
+
+All language-model providers are optional. Missing cloud API keys, a stopped Ollama service, or a missing local model do not prevent the backend or frontend from starting. Login, repository import, parsing, indexing, Discover, file browsing, History, provider health, Usage, and stored evaluations remain available without an LLM.
+
+Unavailable configured models remain visible with an unavailable reason and cannot start a new Ask, Compare, or Wiki execution from the UI. Local models are never downloaded automatically; install them explicitly with `ollama pull <exact-model-tag>`.
+
+SecurityCodeWiki never silently substitutes one language model for another. Ask requires the selected model to be available. Compare keeps each requested provider/model identity, records unavailable results separately, and does not change the frozen evidence package supplied to the other requested models. This is essential for reproducible model evaluation.
 
 ## Runtime storage
 
@@ -207,14 +280,14 @@ Deleting runtime databases or indexes can remove local projects, history, evalua
 ## Typical workflow
 
 1. Start the backend and frontend.
-3. Optionally provide a repository subfolder for a focused import.
-4. Wait for scanning, parsing, chunking, embedding, and indexing.
-5. Use **Discover** to find security-relevant files and symbols.
-6. Open source or select an analysis focus.
-7. Generate a **Security Wiki** when supplementary orientation is useful.
-8. Use **Ask** and inspect the primary evidence cards beside the answer.
-9. Use **Compare** to evaluate supported models against one frozen package.
-10. Review **History**, evaluation status, and **Usage & Cost** details.
+2. Import a Git-cloneable repository or ZIP, optionally selecting a repository subfolder.
+3. Wait for scanning, parsing, chunking, embedding, and indexing.
+4. Use **Discover** to find security-relevant files and symbols.
+5. Open source or select an analysis focus.
+6. Generate a **Security Wiki** when supplementary orientation is useful.
+7. Use **Ask** and inspect the primary evidence cards beside the answer.
+8. Use **Compare** to evaluate supported models against one frozen package.
+9. Review **History**, evaluation status, and **Usage & Cost** details.
 
 ## Ask, Compare, and reproducibility
 
@@ -238,8 +311,16 @@ The backend validates model references against the supplied E/X namespaces and r
 
 Backend tests:
 
+Linux/macOS, with `.venv` activated:
+
 ```bash
 python -m pytest backend/tests -q -c backend/pytest.ini
+```
+
+Windows PowerShell, from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend\tests -q -c backend\pytest.ini
 ```
 
 Frontend production build (includes TypeScript project compilation):

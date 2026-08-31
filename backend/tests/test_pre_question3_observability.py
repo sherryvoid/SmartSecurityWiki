@@ -36,6 +36,15 @@ def test_structured_answer_projection_preserves_all_sections():
         assert expected.strip() in rendered
 
 
+def test_structured_answer_projection_normalizes_string_limitations_once():
+    from app.services.methodology import render_structured_answer_payload
+    limitation = "None; all endpoints, authorities, and user configurations are explicitly defined in the provided evidence."
+    rendered = render_structured_answer_payload({"answer": "Grounded.", "limitations": limitation})
+    assert rendered.count(f"- {limitation}") == 1
+    assert "\n- N\n- o\n- n\n- e" not in rendered
+    assert render_structured_answer_payload({"answer": "Grounded.", "limitations": ["First", "Second"]}).endswith("- First\n- Second")
+
+
 def test_compare_full_answer_persists_and_history_restores(isolated_env, monkeypatch):
     from app.db.database import db, init_db
     from app.db.schemas import CompareRequest

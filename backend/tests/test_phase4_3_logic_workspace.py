@@ -82,6 +82,70 @@ def test_compare_sends_identical_ordered_evidence_to_cloud_and_ollama(isolated_e
     assert all("[E10]" in messages[-1]["content"] for messages in prompts.values())
 
 
+def test_compare_is_invalid_when_one_identical_package_fails_context_preflight(isolated_env, monkeypatch):
+    from app.db.database import init_db
+    from app.db.schemas import CompareRequest
+    from app.services import audit_service
+    init_db()
+    chunks = [_chunk(str(index), "x" * 40) for index in range(1, 11)]
+    monkeypatch.setattr(audit_service, "retrieve_evidence_package", lambda *args, **kwargs: {"source_chunks": chunks, "wiki_chunks": [], "diagnostics": {}})
+    monkeypatch.setattr(audit_service, "is_provider_available", lambda name: True)
+
+    class Provider:
+        def __init__(self, name):
+            self.name = name
+            self.calls = 0
+            if name == "ollama":
+                from app.core.config import Settings
+                self.settings = Settings(ollama_context_length=100, ollama_num_predict=20)
+
+        def count_prompt_tokens(self, messages, model):
+            return 90
+
+        async def generate(self, messages, model):
+            self.calls += 1
+            if self.name == "ollama":
+                return {"content": "answer", "ok": True, "validation_status": "valid_simple", "diagnostics": {}}
+            return {"content": json.dumps({"answer": "answer", "confidence": "high", "evidence_refs": [], "helper_chain": [], "limitations": [], "needs_review": False}), "ok": True, "diagnostics": {}}
+
+    providers = {}
+    def provider_for(name):
+        providers[name] = Provider(name)
+        return providers[name], "neutral-model"
+    monkeypatch.setattr(audit_service, "provider_for", provider_for)
+    result = asyncio.run(audit_service.compare_models("project", CompareRequest(question="q", providers=["gemini", "ollama"])))
+    assert result["primary_evidence_match"] is True
+    assert result["results"][1]["evidence_package_match"] is True
+    assert result["results"][1]["validation_status"] == "provider_context_incompatible"
+    assert providers["ollama"].calls == 0
+    assert result["effective_context_valid"] is False
+    assert result["comparison_valid"] is False
+
+
+def test_compare_remains_valid_when_both_prompt_preflights_pass(isolated_env, monkeypatch):
+    from app.db.database import init_db
+    from app.db.schemas import CompareRequest
+    from app.services import audit_service
+    init_db()
+    chunks = [_chunk("one")]
+    monkeypatch.setattr(audit_service, "retrieve_evidence_package", lambda *args, **kwargs: {"source_chunks": chunks, "wiki_chunks": [], "diagnostics": {}})
+    monkeypatch.setattr(audit_service, "is_provider_available", lambda name: True)
+
+    class Provider:
+        name = "ollama"
+        def __init__(self):
+            from app.core.config import Settings
+            self.settings = Settings(ollama_context_length=100, ollama_num_predict=20)
+        def count_prompt_tokens(self, messages, model): return 70
+        async def generate(self, messages, model): return {"content": "answer", "ok": True, "validation_status": "valid_simple", "diagnostics": {}}
+
+    monkeypatch.setattr(audit_service, "provider_for", lambda name: (Provider(), f"{name}-model"))
+    result = asyncio.run(audit_service.compare_models("project", CompareRequest(question="q", providers=["ollama::model-a", "ollama::model-b"])))
+    assert all(item["effective_context_valid"] for item in result["results"])
+    assert result["effective_context_valid"] is True
+    assert result["comparison_valid"] is True
+
+
 def test_evaluation_mismatch_cannot_be_scored(isolated_env):
     from app.db.database import db, init_db
     from app.db.schemas import EvaluationScoreRequest

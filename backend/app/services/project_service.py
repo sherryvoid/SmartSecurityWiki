@@ -19,16 +19,16 @@ from app.db.schemas import ProjectCreate
 from app.services.files import build_file_tree, is_relevant_file, language_for_path, read_text, safe_relative_path
 from app.services.parser import chunk_source
 from app.services.security_detection import confidence_for_tags, detect_security_tags
-from app.services.vector_index import HTTP_VERB_TAGS, clear_project, expand_security_query, index_code_chunk, query as vector_query, rescore_chunks
+from app.services.vector_index import HTTP_VERB_TAGS, clear_project, expand_security_query, has_manifest_component_intent, index_code_chunk, query as vector_query, rescore_chunks
 
 
 SELECTED_FILE_BOOST = 0.18
 
 
 ANDROID_CASE_STUDIES = [
-    {"id": "account-manager-service", "name": "AccountManagerService", "hint": "Link an Android source tree or GitHub URL containing AccountManagerService.java."},
-    {"id": "service-manager", "name": "ServiceManager", "hint": "Link Android framework/native service manager sources."},
-    {"id": "binder-token-handling", "name": "Binder Token Handling", "hint": "Link Android Binder-related source package."},
+    {"id": "account-manager-service", "name": "AccountManagerService", "hint": "Use a Git-cloneable Android repository containing AccountManagerService.java.", "repository_url": None, "revision": None, "subfolder_path": None, "default_security_goal": None},
+    {"id": "service-manager", "name": "ServiceManager", "hint": "Use a Git-cloneable repository containing Android framework/native service manager sources.", "repository_url": None, "revision": None, "subfolder_path": None, "default_security_goal": None},
+    {"id": "binder-token-handling", "name": "Binder Token Handling", "hint": "Use a Git-cloneable repository containing the Android Binder sources to study.", "repository_url": None, "revision": None, "subfolder_path": None, "default_security_goal": None},
 ]
 
 
@@ -49,13 +49,16 @@ def create_project(payload: ProjectCreate) -> dict:
     (project_root / "wiki").mkdir(parents=True, exist_ok=True)
     repo_path.mkdir(parents=True, exist_ok=True)
     source_url = normalize_source_url(payload.repo_url if payload.source_type == "github" else payload.android_source_url)
+    if payload.source_type == "android" and not source_url:
+        raise ValueError("A Git-cloneable Android repository URL is required.")
     subfolder_path = normalize_subfolder_path(payload.subfolder_path)
+    android_case_study = payload.android_case_study.strip() if payload.source_type == "android" and payload.android_case_study and payload.android_case_study.strip() else None
     timestamp = now()
     with db() as connection:
         connection.execute(
             """
-            INSERT INTO projects (id, name, source_type, repo_url, local_path, subfolder_path, commit_hash, status, status_message, security_goal, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO projects (id, name, source_type, repo_url, local_path, subfolder_path, android_case_study, commit_hash, status, status_message, security_goal, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
@@ -64,6 +67,7 @@ def create_project(payload: ProjectCreate) -> dict:
                 source_url,
                 str(repo_path.resolve()),
                 subfolder_path,
+                android_case_study,
                 None,
                 "created",
                 "Project created.",
@@ -434,7 +438,11 @@ def _existence_intent(query: str) -> bool:
     subject_first = bool(re.search(rf"\b(?:does|do|whether)\s+{EXISTENCE_SUBJECTS}\s+(?:\w+[\s,]+)*(?:{EXISTENCE_VERB_WORDS})\b", lowered))
     state_then_scope = bool(re.search(rf"\b(?:is|are)\b.+?\b{EXISTENCE_STATES}\b.+?\b(?:in|from|within)\s+{EXISTENCE_SUBJECTS}\b", lowered))
     anywhere_action = bool(re.search(r"\b(?:defined|declared|assigned|configured|checked|authorized|used|referenced|present|supported|implemented|found)\b.+?\banywhere\b", lowered))
-    return (repository_scope and (subject_first or (existential and "there" in lowered) or state_then_scope or anywhere_action or named_concept)) or grouped_implemented
+    coordinated_state = bool(
+        re.search(rf"\bwhether\b.+?\b{EXISTENCE_STATES}\b", lowered)
+        or re.search(r"^(?:is|are)\b.+?\b(?:present|implemented|found|absent|missing)\b", lowered)
+    )
+    return (repository_scope and (subject_first or (existential and "there" in lowered) or state_then_scope or anywhere_action or named_concept)) or grouped_implemented or coordinated_state
 
 
 def _explicit_existence_concepts(query: str) -> list[str]:
@@ -457,27 +465,66 @@ def _extract_repository_existence_concepts(query: str) -> list[str]:
     if not _existence_intent(query):
         return []
     explicit = _explicit_existence_concepts(query)
-    if explicit:
+    if len(explicit) >= 2:
         return explicit
     normalized = " ".join(query.replace("\n", " ").split())
+    clauses = re.split(r"(?<=[?;])\s+|(?<=\.)\s+(?=[A-Z])", normalized)
     patterns = (
         rf"\bdoes\s+{EXISTENCE_SUBJECTS}\s+{EXISTENCE_VERBS}\s+(?P<concept>.+?)(?=(?:[?.;]|,\s*(?:and\s+)?whether\b))",
         rf"\bwhether\s+{EXISTENCE_SUBJECTS}\s+{EXISTENCE_VERBS}\s+(?:any\s+)?(?P<concept>.+?)(?=(?:[?.;]|,\s*(?:and\s+)?(?:do|does|is|are|whether)\b))",
         r"\bis\s+there\s+(?:any\s+)?(?P<concept>.+?)(?=(?:[?.;]|\s+anywhere\b))",
         r"\b(?:does|do)\s+(?P<concept>.+?)\s+exist(?:\s+anywhere)?(?=[?.;])",
         rf"\b(?:is|are)\s+(?P<concept>.+?)\s+{EXISTENCE_STATES}\s+(?:anywhere\s+)?(?:in|within|from)\s+{EXISTENCE_SUBJECTS}(?=[?.;])",
+        rf"\bwhether\s+(?P<concept>.+?)\s+(?:is|are)\s+(?:actually\s+)?{EXISTENCE_STATES}(?:\s+(?:anywhere\s+)?(?:in|within|from)\s+{EXISTENCE_SUBJECTS})?(?=[?.;])",
+        rf"\b(?:is|are)\s+(?P<concept>.+?)\s+(?:actually\s+)?{EXISTENCE_STATES}(?=[?.;])",
     )
     concepts = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, normalized, re.IGNORECASE):
+    for clause in clauses:
+        if not _existence_intent(clause):
+            continue
+        for pattern in patterns:
+          for match in re.finditer(pattern, clause, re.IGNORECASE):
             concept = match.group("concept").strip(" ,")
             concept = re.sub(r"^(?:any|a|an)\s+", "", concept, flags=re.IGNORECASE)
+            concept = re.sub(r"^(?:actually|explicitly)\s+|\s+(?:actually|explicitly)$", "", concept, flags=re.IGNORECASE)
             concept = re.split(r"\s+such\s+as\s+", concept, maxsplit=1, flags=re.IGNORECASE)[0]
             concept = re.sub(r"\s+anywhere$", "", concept, flags=re.IGNORECASE)
             concept = re.sub(r"\s+(?:in|within)\s+(?:the\s+)?(?:repository|project|application|codebase|source tree|code)$", "", concept, flags=re.IGNORECASE)
-            if concept and concept.lower() not in {item.lower() for item in concepts}:
-                concepts.append(concept)
-    return concepts
+            decomposed = _split_coordinated_existence_concepts(concept)
+            for item in decomposed:
+                if item and item.lower() not in {value.lower() for value in concepts}:
+                    concepts.append(item)
+    concepts = [item for item in concepts if item.lower() not in {"actually", "explicitly"}]
+    if concepts and not (explicit and len(concepts) == 1):
+        return concepts
+    return explicit or concepts
+
+
+def _split_coordinated_existence_concepts(value: str) -> list[str]:
+    """Split only an existence-question list, preserving each multi-word semantic unit."""
+    cleaned = re.sub(r"\s+", " ", value).strip(" ,.;?")
+    cleaned = re.sub(r"^(?:whether|any|a|an|the|both|either)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+(?:are|is)\s+(?:actually\s+)?$", "", cleaned, flags=re.IGNORECASE)
+    has_list_syntax = "," in cleaned or bool(re.search(r"\s+(?:or|and)\s+", cleaned, re.IGNORECASE))
+    if not has_list_syntax:
+        return [cleaned] if cleaned else []
+    if "," not in cleaned and re.search(r"\s+(?:and|or)\s+.+?\b(?:between|within|of|for)\b", cleaned, re.IGNORECASE):
+        return [cleaned]
+    parts = re.split(r"\s*,\s*|\s+(?:and|or)\s+", cleaned, flags=re.IGNORECASE)
+    output = []
+    for part in parts:
+        part = re.sub(r"^(?:and|or|both|either|any|a|an|the)\s+", "", part.strip(" ,"), flags=re.IGNORECASE)
+        slash_parts = [item.strip() for item in part.split("/") if item.strip()]
+        if len(slash_parts) > 1:
+            final_words = slash_parts[-1].split()
+            shared_suffix = final_words[-1] if len(final_words) > 1 else ""
+            for index, item in enumerate(slash_parts):
+                candidate = item if index == len(slash_parts) - 1 or not shared_suffix else f"{item} {shared_suffix}"
+                if candidate.lower() not in {existing.lower() for existing in output}:
+                    output.append(candidate)
+        elif part and part.lower() not in {existing.lower() for existing in output}:
+            output.append(part)
+    return output
 
 
 def _concept_search_variants(concept: str) -> list[str]:
@@ -489,7 +536,12 @@ def _concept_search_variants(concept: str) -> list[str]:
         if not words:
             continue
         phrase = " ".join(words)
-        for value in (phrase, "".join(word.title() for word in words), "_".join(words), "-".join(words)):
+        generic_tail = {"behavior", "handling", "usage", "configuration", "implementation", "logic", "support"}
+        core = " ".join(words[:-1]) if len(words) > 1 and words[-1] in generic_tail else ""
+        core_words = words[:-1] if core else []
+        original_identifier = concept.strip() if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$.:-]*", concept.strip()) else ""
+        for value in (phrase, "".join(word.title() for word in words), "_".join(words), "-".join(words), core,
+                      "".join(word.title() for word in core_words), "_".join(core_words), "-".join(core_words), original_identifier):
             if value and value.lower() not in {item.lower() for item in variants}:
                 variants.append(value)
     return variants
@@ -706,6 +758,7 @@ def retrieve_evidence_package(project_id: str, query: str, top_k: int, db_conn: 
     else:
         expanded_query = expand_security_query(query)
     enumeration_intent = _has_enumeration_intent(query)
+    manifest_component_intent = has_manifest_component_intent(query)
     terms = _query_features(expanded_query)["terms"]
     selected_file_path = _normalize_selected_file_path(module_id)
     vector_hits = vector_query(project_id, expanded_query, limit=max(top_k * 3, top_k), source_type="code")
@@ -806,6 +859,7 @@ def retrieve_evidence_package(project_id: str, query: str, top_k: int, db_conn: 
                 "selected_file_match": selected_file_match,
                 "selected_file_boost": SELECTED_FILE_BOOST if selected_file_match else 0.0,
                 "direct_downstream_implementation": direct_downstream_implementation,
+                "manifest_component_intent": manifest_component_intent,
             }
         candidate_roles = _classify_evidence_roles(candidate, strict_downstream_helper)
         candidate["evidence_role_relevance"] = min(1.0, len(candidate_roles.intersection(requested_roles)) / max(1, len(requested_roles)))
@@ -828,6 +882,13 @@ def retrieve_evidence_package(project_id: str, query: str, top_k: int, db_conn: 
         enumeration_intent,
     )
     source_chunks = _apply_evidence_role_coverage(source_chunks, ranked_candidates, requested_roles, top_k, strict_downstream_helper)
+    source_chunks, manifest_completeness = _apply_manifest_component_completeness(
+        source_chunks, ranked_candidates, enumeration_intent, manifest_component_intent, selected_file_path, top_k
+    )
+    effective_packing_limit = max(top_k, len(manifest_completeness.get("added_or_retained_chunk_ids", [])))
+    source_chunks, packing_diagnostics = _pack_overlapping_evidence(
+        source_chunks, ranked_candidates, requested_roles, effective_packing_limit, strict_downstream_helper
+    )
     source_chunks = _order_prompt_evidence(source_chunks, requested_roles, strict_downstream_helper)
     evidence_role_by_chunk = {item["chunk_id"]: sorted(_classify_evidence_roles(item, strict_downstream_helper)) for item in source_chunks}
     role_satisfaction_reason = {
@@ -873,7 +934,10 @@ def retrieve_evidence_package(project_id: str, query: str, top_k: int, db_conn: 
                 for item in source_chunks if item.get("selected_file_match")
             }),
             "enumeration_intent": enumeration_intent,
+            "manifest_component_intent": manifest_component_intent,
+            "manifest_component_completeness": manifest_completeness,
             "candidates_removed_by_deduplication": removed_by_deduplication,
+            **packing_diagnostics,
             "expanded_query": expanded_query,
             "repository_concept_existence_intent": bool(existence_concepts),
             "repository_existence_concepts_requested": existence_concepts,
@@ -920,6 +984,21 @@ EVIDENCE_ROLE_PHRASES = {
 def _extract_evidence_roles(query: str) -> set[str]:
     lowered = query.lower()
     roles = {role for role, phrases in EVIDENCE_ROLE_PHRASES.items() if any(phrase in lowered for phrase in phrases)}
+    if _has_manifest_component_enumeration_intent(query):
+        roles.add("needs_endpoint_declarations")
+    if _has_bootstrap_privileged_identity_intent(lowered):
+        roles.update(("needs_user_assignments", "needs_authority_checks"))
+    if _has_state_dependent_write_restriction_intent(lowered):
+        roles.add("needs_authority_checks")
+    if _has_prerequisite_authorization_intent(lowered):
+        roles.add("needs_authority_checks")
+    if _has_authority_mutation_intent(lowered):
+        roles.add("needs_authority_checks")
+    privileged_role_intent = _has_privileged_role_distinction_intent(lowered)
+    if privileged_role_intent:
+        roles.add("needs_authority_checks")
+        if _has_role_establishment_intent(lowered):
+            roles.add("needs_user_assignments")
     if "claim" in lowered and any(marker in lowered for marker in ("custom", "roles", "authorities", "permissions", "scope")) and any(marker in lowered for marker in ("convert", "become", "mapped", "claim name")):
         roles.add("needs_claim_definition")
     conversion_question = "needs_authority_conversion" in roles
@@ -956,18 +1035,190 @@ def _extract_evidence_roles(query: str) -> set[str]:
     return roles
 
 
+def _has_bootstrap_privileged_identity_intent(lowered_query: str) -> bool:
+    """Recognize setup flows that establish the first privileged identity."""
+    setup_action = bool(re.search(
+        r"\b(?:bootstrap(?:s|ped|ping)?|initiali[sz](?:e|es|ed|ing|ation)|"
+        r"provision(?:s|ed|ing)?|set[ -]?up|setup|creat(?:e|es|ed|ing)|"
+        r"establish(?:es|ed|ing)?)\b",
+        lowered_query,
+    ))
+    container = bool(re.search(
+        r"\b(?:workspace|tenant|organi[sz]ation|household|project|account|team)s?\b",
+        lowered_query,
+    ))
+    initial_privileged_identity = bool(re.search(
+        r"\b(?:first|initial)\s+(?:privileged\s+member|owner|administrator|admin)\b",
+        lowered_query,
+    ))
+    return setup_action and container and initial_privileged_identity
+
+
+def _has_state_dependent_write_restriction_intent(lowered_query: str) -> bool:
+    """Recognize lifecycle-state write policies without requiring an RBAC actor."""
+    mutation = bool(re.search(
+        r"\b(?:write|writes|writing|written|create|creates|created|creating|"
+        r"update|updates|updated|updating|delete|deletes|deleted|deleting|"
+        r"modify|modifies|modified|modifying|edit|edits|edited|editing|"
+        r"insert|inserts|inserted|inserting|remove|removes|removed|removing|"
+        r"mutate|mutates|mutated|mutating|mutation|mutations|change|changes|changed|changing|"
+        r"field|fields|operation|operations|action|actions)\b",
+        lowered_query,
+    ))
+    restriction = bool(re.search(
+        r"\b(?:block|blocks|blocked|blocking|deny|denies|denied|forbid|forbids|forbidden|"
+        r"prevent|prevents|prevented|preventing|disallow|disallows|disallowed|disallowing|read[ -]?only|"
+        r"cannot\s+(?:be\s+)?(?:writ|creat|updat|delet|modif|edit|insert|remov|mutat|chang)|"
+        r"locked\s+against\s+(?:write|writes|writing|changes?))\b",
+        lowered_query,
+    ))
+    lifecycle_state = bool(re.search(
+        r"\b(?:clos(?:e|ed|ure)|frozen|freez(?:e|es|ing)|finaliz(?:e|es|ed|ing|ation)|"
+        r"archiv(?:e|es|ed|ing)|lock(?:ed|s|ing)|suspend(?:ed|s|ing)|"
+        r"complet(?:e|es|ed|ing|ion)|publish(?:ed|es|ing)|publication|settle(?:d|s|ment)|"
+        r"terminat(?:e|es|ed|ing|ion))\b",
+        lowered_query,
+    ))
+    adverse_state = bool(re.search(
+        r"\b(?:closed|frozen|finalized|archived|locked|suspended|settled|terminated)\b",
+        lowered_query,
+    ))
+    modal_policy_question = bool(re.search(r"^\s*(?:can|may)\b", lowered_query)) and bool(
+        re.search(r"\b(?:after|once|when)\b", lowered_query)
+    ) and adverse_state
+    return mutation and lifecycle_state and (restriction or modal_policy_question)
+
+
+def _has_prerequisite_authorization_intent(lowered_query: str) -> bool:
+    """Recognize actor-operation-condition authorization questions conservatively."""
+    actor = bool(re.search(
+        r"\b(?:user|caller|principal|account|subject|member|authenticated\s+(?:actor|user|caller|principal))\b",
+        lowered_query,
+    ))
+    protected_operation = bool(re.search(
+        r"\b(?:join|create|register|activate|add|enroll|modify|access|perform|write|update|delete)\w*\b",
+        lowered_query,
+    ))
+    condition = bool(re.search(
+        r"\b(?:without|only\s+if|unless|requires?|required|prerequisite|must\s+have|"
+        r"must\s+(?:there\s+)?(?:already\s+)?be|allowed\s+when|permitted\s+when|blocked\s+unless|before)\b",
+        lowered_query,
+    ))
+    authorization_orientation = bool(re.search(
+        r"\b(?:can|may|allowed|permitted|denied|blocked|enforc\w*|prevent\w*|bypass\w*|authoriz\w*|policy|access)\b",
+        lowered_query,
+    ))
+    actor_operation_question = actor and protected_operation and condition and authorization_orientation
+    abstract_policy_question = bool(re.search(r"\b(?:operation|action)\b", lowered_query)) and condition and bool(
+        re.search(r"\b(?:allowed|permitted|denied|blocked|enforc\w*|policy)\b", lowered_query)
+    )
+    proof_of_actor_gate = actor and protected_operation and bool(re.search(
+        r"\b(?:condition|prerequisite)\b.*\b(?:satisfied|enforced|proves?|source)\b|"
+        r"\b(?:proves?|source)\b.*\b(?:condition|prerequisite|enforced)\b",
+        lowered_query,
+    ))
+    return actor_operation_question or abstract_policy_question or proof_of_actor_gate
+
+
+def _has_authority_mutation_intent(lowered_query: str) -> bool:
+    """Recognize protected authority-value changes without matching ordinary edits."""
+    actor = bool(re.search(
+        r"\b(?:user|caller|account|principal|subject|recipient|client|member|operator)\b",
+        lowered_query,
+    ))
+    authority_value = bool(re.search(
+        r"\b(?:role|permission|privilege|authority|entitlement|access\s+(?:level|scope)|scope|"
+        r"security\s+(?:tier|level)|assigned\s+(?:level|tier)|authorization\s+level)\b",
+        lowered_query,
+    ))
+    mutation = bool(re.search(
+        r"\b(?:chang(?:e|es|ed|ing)|alter(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|overrid(?:e|es|den|ing)|"
+        r"replac(?:e|es|ed|ing)|choos(?:e|es|ing)|upgrade(?:s|d|ing)?|downgrade(?:s|d|ing)?|"
+        r"preserv(?:e|es|ed|ing)|rewrit(?:e|es|ten|ing)|"
+        r"select\s+another|set\s+(?:to\s+)?another|assign\s+(?:a\s+)?different|keep\s+unchanged)\b",
+        lowered_query,
+    ))
+    protected_workflow = bool(re.search(
+        r"\b(?:authorization|access|approval|acceptance|accepting|accepted|activate|activation|activating|"
+        r"enroll|enrollment|registration|membership|grant|assignment|protected\s+operation|"
+        r"security\s+decision|policy[- ]controlled\s+workflow|workflow|token)\b",
+        lowered_query,
+    ))
+    return actor and authority_value and mutation and protected_workflow
+
+
+def _has_privileged_role_distinction_intent(lowered_query: str) -> bool:
+    """Recognize authorization-role comparisons without treating every use of 'role' as security."""
+    explicit_privilege = bool(re.search(r"\b(?:privileg(?:e|ed)|elevated|higher[- ]privilege|lower[- ]privilege)\b", lowered_query))
+    authorization_context = bool(re.search(r"\b(?:role|authorit(?:y|ies|zation|zed)|permission|access|privileg(?:e|ed|es))\b", lowered_query))
+    comparative_or_decision = bool(re.search(
+        r"\b(?:distinguish(?:ed|es)?|differ(?:s|ent)?|versus|vs\.?|ordinary|standard|lower[- ]privilege|"
+        r"what makes|determin(?:e|es|ed|ing)|check(?:s|ed|ing)? whether)\b",
+        lowered_query,
+    ))
+    establishment = _has_role_establishment_intent(lowered_query)
+    return authorization_context and (
+        (explicit_privilege and (comparative_or_decision or establishment))
+        or (comparative_or_decision and bool(re.search(r"\b(?:permission|access|authoriz|elevated|privileged)\w*\b", lowered_query)))
+    )
+
+
+def _has_role_establishment_intent(lowered_query: str) -> bool:
+    action = r"(?:establish(?:es|ed|ing)?|assign(?:s|ed|ing|ment)?|creat(?:e|es|ed|ing)|initializ(?:e|es|ed|ing)|bootstrap(?:s|ped|ping)?|stor(?:e|es|ed|ing)|persist(?:s|ed|ing|ence)?|grant(?:s|ed|ing)?)"
+    role_subject = r"(?:role|authorit(?:y|ies)|privileg(?:e|ed|es)|identity|principal|user)"
+    nearby_words = r"(?:\W+\w+){0,6}\W+"
+    return bool(re.search(rf"\b(?:{action}{nearby_words}{role_subject}|{role_subject}{nearby_words}{action})\b", lowered_query))
+
+
+GENERIC_POLICY_DECISION_PATTERN = re.compile(
+    r"^[ \t]*(?:allow|permit|deny|authorize)\s+"
+    r"(?:create|read|write|update|delete)(?:\s*,\s*(?:create|read|write|update|delete))*"
+    r"\s*:?\s*(?:if|when|unless)\s+(?P<predicate>[^;\n]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+GENERIC_POLICY_IDENTITY_MARKERS = (
+    "auth", "authenticated", "signedin", "signed_in", "signed-in", "principal", "caller",
+    "subject", "identity", "userid", "user_id", "uid", "owner", "member", "admin", "role",
+)
+
+
+def _has_conditional_authorization_policy(code: str) -> bool:
+    """Recognize concrete, generic policy decisions without treating CRUD prose as enforcement."""
+    for match in GENERIC_POLICY_DECISION_PATTERN.finditer(code):
+        predicate = match.group("predicate").strip()
+        lowered = predicate.lower().replace(" ", "")
+        helper_call = bool(re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^\n;]*\)", predicate))
+        identity_predicate = any(marker in lowered for marker in GENERIC_POLICY_IDENTITY_MARKERS) and bool(
+            re.search(r"(?:==|!=|\bin\b|\bis\b|&&|\|\||\band\b|\bor\b)", predicate, re.IGNORECASE)
+        )
+        if helper_call or identity_predicate:
+            return True
+    return False
+
+
 def _classify_evidence_roles(item: dict, strict_downstream_helper: bool = False) -> set[str]:
     text = f"{item.get('file_path', '')} {item.get('symbol_name', '')} {item.get('security_tags', '')} {item.get('code_snippet', '')}".lower()
     roles = set()
+    manifest_component = item.get("chunk_type") == "xml_component" and bool(item.get("manifest_component_intent"))
+    if manifest_component:
+        roles.add("needs_endpoint_declarations")
+        if re.search(
+            r"\b[A-Za-z_][\w.-]*:(?:permission|readPermission|writePermission)\s*=",
+            item.get("code_snippet", ""),
+            re.IGNORECASE,
+        ):
+            roles.add("needs_authority_checks")
     if item.get("http_method") or any(marker in text for marker in ("@getmapping", "@postmapping", "@deletemapping", "@putmapping", "@patchmapping", "@route(", "router.get(", "router.post(", "app.get(", "app.post(")):
         roles.add("needs_endpoint_declarations")
     if item.get("class_route") is not None or item.get("method_route") is not None:
         roles.add("needs_route_resolution")
-    if any(marker in text for marker in ("hasauthority", "hasanyauthority", "hasrole", "preauthorize", "secured", "rolesallowed", "require_permission", "permission_required", "authorize(")):
+    if any(marker in text for marker in ("hasauthority", "hasanyauthority", "hasrole", "preauthorize", "secured", "rolesallowed", "require_permission", "permission_required", "authorize(")) or _has_conditional_authorization_policy(item.get("code_snippet", "")):
         roles.add("needs_authority_checks")
     principal_indicator = any(marker in text for marker in (".username(", "withuser(", "withusername(", "user.withusername(", "userdetails.builder", "new user(", "principal(", "username ="))
     assignment_indicator = any(marker in text for marker in (".authorities(", ".roles(", "grantedauthority", "simplegrantedauthority", "authoritylist", "authorities =", "roles ="))
     if principal_indicator and assignment_indicator:
+        roles.add("needs_user_assignments")
+    if _has_concrete_identity_role_assignment(item.get("file_path", ""), item.get("code_snippet", "")):
         roles.add("needs_user_assignments")
     if any(marker in text for marker in ("websecurity", "securityconfig", "securityfilterchain", "httpsecurity", "userdetailsservice", "inmemoryuserdetailsmanager")):
         roles.add("needs_security_configuration")
@@ -1013,11 +1264,37 @@ def _classify_evidence_roles(item: dict, strict_downstream_helper: bool = False)
     return roles
 
 
+def _has_concrete_identity_role_assignment(file_path: str, code: str) -> bool:
+    """Detect a real identity-to-role construction/write while rejecting descriptive prose."""
+    extension = os.path.splitext(str(file_path or "").lower())[1]
+    if extension in {".md", ".txt", ".xml", ".rst", ".adoc"}:
+        return False
+    executable = re.sub(r"/\*.*?\*/", " ", str(code or ""), flags=re.DOTALL)
+    executable = "\n".join(line for line in executable.splitlines() if not line.lstrip().startswith(("//", "#", "*")))
+    identity_association = bool(re.search(
+        r"\b(?:user_?id|uid|principal(?:_?id)?|subject(?:_?id)?|identity(?:_?id)?|current_?user|currentprincipal|currentidentity)\b",
+        executable,
+        re.IGNORECASE,
+    ))
+    explicit_role_assignment = bool(re.search(
+        r"(?:['\"](?:role|authority|privilege)['\"]|\b(?:role|authority|privilege)\b)\s*(?:to|:|=)\s*[A-Za-z_'\"]",
+        executable,
+        re.IGNORECASE,
+    ))
+    persistent_write = bool(re.search(r"\.(?:set|save|insert|put|create|add|update|upsert)\s*\(", executable, re.IGNORECASE))
+    constructed_assignment = bool(re.search(
+        r"\b[A-Z][A-Za-z0-9_]*\s*\([^)]*\b(?:role|authority|privilege)\s*=",
+        executable,
+        re.IGNORECASE | re.DOTALL,
+    ))
+    return identity_association and explicit_role_assignment and (persistent_write or constructed_assignment)
+
+
 def _role_satisfaction_reasons(item: dict, strict_downstream_helper: bool = False) -> dict[str, str]:
     roles = _classify_evidence_roles(item, strict_downstream_helper)
     labels = {
         "needs_user_assignments": "Chunk contains both a principal/user construction indicator and an authority/role assignment indicator.",
-        "needs_endpoint_declarations": "Chunk contains an HTTP endpoint mapping declaration.",
+        "needs_endpoint_declarations": "Chunk contains a requested HTTP endpoint or Android manifest component declaration.",
         "needs_route_resolution": "Chunk contains parser-derived route metadata.",
         "needs_authority_checks": "Chunk contains an authority/role authorization construct.",
         "needs_security_configuration": "Chunk contains a recognized security configuration construct.",
@@ -1138,6 +1415,300 @@ def _apply_evidence_role_coverage(current: list[dict], ranked: list[dict], reque
     return _dedupe_source_chunks(result)[:top_k]
 
 
+def _apply_manifest_component_completeness(
+    current: list[dict], ranked: list[dict], enumeration_intent: bool,
+    manifest_component_intent: bool, selected_file_path: str | None, top_k: int,
+) -> tuple[list[dict], dict]:
+    """Collect every in-scope manifest component only for bounded component enumeration."""
+    active = enumeration_intent and manifest_component_intent
+    if not active:
+        return list(current), {
+            "active": False,
+            "candidate_count": 0,
+            "added_chunk_ids": [],
+            "added_or_retained_chunk_ids": [],
+        }
+    component_candidates = [
+        item for item in ranked
+        if item.get("chunk_type") == "xml_component"
+        and (
+            not selected_file_path
+            or _normalize_selected_file_path(item.get("file_path")) == selected_file_path
+        )
+    ]
+    active_manifest_path = selected_file_path
+    if not active_manifest_path and component_candidates:
+        active_manifest_path = _normalize_selected_file_path(component_candidates[0].get("file_path"))
+    components = [
+        item for item in component_candidates
+        if not active_manifest_path
+        or _normalize_selected_file_path(item.get("file_path")) == active_manifest_path
+    ]
+    components = sorted(
+        _dedupe_source_chunks(components),
+        key=lambda item: (
+            _normalize_selected_file_path(item.get("file_path")),
+            int(item.get("start_line") or 0),
+            str(item.get("symbol_name") or ""),
+        ),
+    )
+    component_ids = {item["chunk_id"] for item in components}
+    current_ids = {item["chunk_id"] for item in current}
+    final_limit = max(top_k, len(components))
+    result = list(components)
+    for item in current:
+        if (
+            item.get("chunk_type") != "xml_component"
+            and item["chunk_id"] not in component_ids
+            and len(result) < final_limit
+        ):
+            result.append(item)
+    return result, {
+        "active": True,
+        "candidate_count": len(components),
+        "added_chunk_ids": [item["chunk_id"] for item in components if item["chunk_id"] not in current_ids],
+        "added_or_retained_chunk_ids": [item["chunk_id"] for item in components],
+        "scope": active_manifest_path or "no_manifest_components_found",
+        "final_limit": final_limit,
+    }
+
+
+STRUCTURAL_PARENT_TYPES = {"class", "interface", "object"}
+STRUCTURAL_CHILD_TYPES = {"function", "method", "constructor", "async_function"}
+SECURITY_RESOURCE_MARKERS = ("auth", "authoriz", "permission", "owner", "member", "admin", "role", "security", "login", "sign_in", "signin")
+PACKING_ACTION_FAMILIES = {
+    "setup": ("bootstrap", "initialize", "initialise", "provision", "setup", "create", "establish"),
+    "join": ("join", "attach", "enroll", "accept"),
+    "update": ("update", "modify", "edit", "change", "replace"),
+    "delete": ("delete", "remove", "archive", "terminate"),
+}
+
+
+def _packing_action_families(text: str) -> set[str]:
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or "")).lower()
+    tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    return {
+        family for family, markers in PACKING_ACTION_FAMILIES.items()
+        if any(marker in tokens or any(token.startswith(marker) for token in tokens) for marker in markers)
+    }
+
+
+def _child_preserves_parent_action_concepts(parent: dict, child: dict) -> bool:
+    """Reject a sibling action when it does not preserve why the parent matched."""
+    parent_signals = " ".join(
+        str(signal) for signal in [*(parent.get("lexical_matches") or []), *(parent.get("exact_identifier_matches") or [])]
+    )
+    required_families = _packing_action_families(parent_signals)
+    if not required_families:
+        return True
+    child_families = _packing_action_families(child.get("symbol_name") or "")
+    if not child_families:
+        return True
+    return bool(required_families.intersection(child_families))
+
+
+def _pack_overlapping_evidence(current: list[dict], ranked: list[dict], requested: set[str], top_k: int, strict_downstream_helper: bool = False) -> tuple[list[dict], dict]:
+    """Remove only structurally proven overlap after ranking and role coverage."""
+    result = list(_dedupe_source_chunks(current))
+    containment_replacements = []
+    for parent in list(result):
+        if parent.get("chunk_type") not in STRUCTURAL_PARENT_TYPES:
+            continue
+        parent_roles = _classify_evidence_roles(parent, strict_downstream_helper).intersection(requested)
+        parent_signals = set(parent.get("lexical_matches") or []) | set(parent.get("exact_identifier_matches") or [])
+        parent_score = float(parent.get("final_score") or 0.0)
+        children = []
+        for child in ranked:
+            if child.get("chunk_type") not in STRUCTURAL_CHILD_TYPES or child.get("file_path") != parent.get("file_path"):
+                continue
+            if not (int(parent.get("start_line") or 0) <= int(child.get("start_line") or -1) and int(child.get("end_line") or -1) <= int(parent.get("end_line") or 0)):
+                continue
+            child_roles = _classify_evidence_roles(child, strict_downstream_helper).intersection(requested)
+            child_signals = set(child.get("lexical_matches") or []) | set(child.get("exact_identifier_matches") or [])
+            independently_relevant = bool(child_roles or child_signals)
+            comparable = float(child.get("final_score") or 0.0) >= parent_score * 0.6
+            concept_preserving = _child_preserves_parent_action_concepts(parent, child)
+            if independently_relevant and comparable and concept_preserving:
+                children.append(child)
+        def child_order(item: dict) -> tuple:
+            symbol = str(item.get("symbol_name") or "").lower()
+            signals = set(item.get("lexical_matches") or []) | set(item.get("exact_identifier_matches") or [])
+            symbol_signal_count = sum(1 for signal in signals if signal and signal.lower() in symbol)
+            return (-symbol_signal_count, item.get("retrieval_rank", 10**9), item.get("start_line", 0))
+
+        children.sort(key=child_order)
+        chosen = []
+        covered_roles, covered_signals = set(), set()
+        for child in children:
+            new_roles = _classify_evidence_roles(child, strict_downstream_helper).intersection(requested) - covered_roles
+            child_signals = set(child.get("lexical_matches") or []) | set(child.get("exact_identifier_matches") or [])
+            if new_roles or child_signals - covered_signals:
+                chosen.append(child)
+                covered_roles.update(_classify_evidence_roles(child, strict_downstream_helper).intersection(requested))
+                covered_signals.update(child_signals)
+            covered_ratio = len(parent_signals.intersection(covered_signals)) / max(1, len(parent_signals))
+            required_ratio = 1.0 if parent_roles else 0.5
+            if parent_roles.issubset(covered_roles) and covered_ratio >= required_ratio:
+                break
+        signal_coverage = len(parent_signals.intersection(covered_signals)) / max(1, len(parent_signals))
+        minimum_signal_coverage = 1.0 if parent_roles else 0.5
+        if not chosen or not parent_roles.issubset(covered_roles) or signal_coverage < minimum_signal_coverage:
+            continue
+        proposed = [item for item in result if item["chunk_id"] != parent["chunk_id"]]
+        for child in chosen:
+            if child["chunk_id"] not in {item["chunk_id"] for item in proposed}:
+                proposed.append(child)
+        if len(proposed) > top_k:
+            continue
+        result = proposed
+        containment_replacements.append({"parent_chunk_id": parent["chunk_id"], "child_chunk_ids": [item["chunk_id"] for item in chosen]})
+
+    result, policy_continuations = _preserve_split_policy_continuations(
+        result, ranked, requested, top_k, strict_downstream_helper
+    )
+    result, locale_removed = _deduplicate_localized_resources(result)
+    return result[:top_k], {
+        "parent_child_replacements": containment_replacements,
+        "parent_child_replacement_count": len(containment_replacements),
+        "localized_resource_chunks_removed": locale_removed,
+        "localized_resource_chunks_removed_count": len(locale_removed),
+        "split_policy_continuations": policy_continuations,
+        "split_policy_continuation_count": len(policy_continuations),
+    }
+
+
+def _preserve_split_policy_continuations(
+    current: list[dict], ranked: list[dict], requested: set[str], top_k: int,
+    strict_downstream_helper: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Keep an exact adjacent chunk only when it completes a split policy decision."""
+    if "needs_authority_checks" not in requested:
+        return list(current), []
+    result = list(_dedupe_source_chunks(current))
+    continuations = []
+    ranked_by_path_start = {
+        (str(item.get("file_path") or ""), int(item.get("start_line") or 0)): item for item in ranked
+    }
+    for first in list(result):
+        if first.get("chunk_type") != "line_range_fallback":
+            continue
+        if "needs_authority_checks" not in _classify_evidence_roles(first, strict_downstream_helper):
+            continue
+        first_code = str(first.get("code_snippet") or "")
+        if not _ends_inside_policy_decision(first_code):
+            continue
+        neighbor = ranked_by_path_start.get((str(first.get("file_path") or ""), int(first.get("end_line") or 0) + 1))
+        if not neighbor or neighbor.get("chunk_type") != "line_range_fallback":
+            continue
+        if not _continues_policy_decision(str(neighbor.get("code_snippet") or "")):
+            continue
+        neighbor_roles = _classify_evidence_roles(neighbor, strict_downstream_helper)
+        neighbor_tags = str(neighbor.get("security_tags") or "").lower()
+        if "needs_authority_checks" not in neighbor_roles and "access_check" not in neighbor_tags:
+            continue
+        if neighbor["chunk_id"] in {item["chunk_id"] for item in result}:
+            continue
+        if len(result) >= top_k:
+            replace_index = next((
+                index for index in range(len(result) - 1, -1, -1)
+                if not result[index].get("selected_file_match")
+                and "needs_authority_checks" not in _classify_evidence_roles(result[index], strict_downstream_helper)
+                and all(
+                    any(
+                        other_index != index and role in _classify_evidence_roles(other, strict_downstream_helper)
+                        for other_index, other in enumerate(result)
+                    )
+                    for role in _classify_evidence_roles(result[index], strict_downstream_helper).intersection(requested)
+                )
+            ), None)
+            if replace_index is None:
+                continue
+            result.pop(replace_index)
+        result.append(neighbor)
+        continuations.append({
+            "first_chunk_id": first["chunk_id"],
+            "continuation_chunk_id": neighbor["chunk_id"],
+            "file_path": first.get("file_path"),
+            "boundary": [first.get("end_line"), neighbor.get("start_line")],
+            "reason": "adjacent chunk completes an unfinished authorization decision",
+        })
+    return _dedupe_source_chunks(result)[:top_k], continuations
+
+
+def _ends_inside_policy_decision(code: str) -> bool:
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    if not lines:
+        return False
+    decision_starts = [index for index, line in enumerate(lines) if re.match(
+        r"^(?:allow|permit|deny|authorize)\b.*\b(?:if|when|unless)\b", line, re.IGNORECASE
+    )]
+    if not decision_starts:
+        return False
+    tail = "\n".join(lines[decision_starts[-1]:])
+    if ";" in tail:
+        return False
+    # A policy decision that starts in this chunk but has no terminator is
+    # structurally incomplete even when its parentheses happen to balance.
+    return True
+
+
+def _continues_policy_decision(code: str) -> bool:
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    if not lines:
+        return False
+    opening = lines[0]
+    starts_as_continuation = bool(re.match(r"^(?:&&|\|\||\band\b|\bor\b|\)|\()", opening, re.IGNORECASE))
+    return starts_as_continuation and ";" in "\n".join(lines)
+
+
+def _localized_resource_family(path: str) -> tuple[str, str, bool] | None:
+    normalized = str(path or "").replace("\\", "/")
+    match = re.match(r"^(.*?/res/)values(?P<qualifier>-[^/]+)?/(?P<name>[^/]+\.xml)$", normalized, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).lower(), match.group("name").lower(), not bool(match.group("qualifier"))
+
+
+def _xml_named_resources(code: str) -> dict[str, str]:
+    return {
+        match.group("name"): match.group(0)
+        for match in re.finditer(r"<(?P<tag>string|string-array|plurals|item)\b[^>]*\bname\s*=\s*['\"](?P<name>[^'\"]+)['\"][^>]*>.*?</(?P=tag)\s*>", str(code or ""), re.IGNORECASE | re.DOTALL)
+    }
+
+
+def _deduplicate_localized_resources(chunks: list[dict]) -> tuple[list[dict], list[str]]:
+    families: dict[tuple[str, str], list[tuple[dict, bool]]] = {}
+    for item in chunks:
+        family = _localized_resource_family(item.get("file_path") or "")
+        if family:
+            families.setdefault(family[:2], []).append((item, family[2]))
+    removed = set()
+    for members in families.values():
+        bases = [item for item, is_base in members if is_base]
+        if len(bases) != 1:
+            continue
+        base = bases[0]
+        base_resources = _xml_named_resources(base.get("code_snippet") or "")
+        if not base_resources:
+            continue
+        base_keys = set(base_resources)
+        for variant, is_base in members:
+            if is_base:
+                continue
+            variant_resources = _xml_named_resources(variant.get("code_snippet") or "")
+            if not variant_resources:
+                continue
+            unique = set(variant_resources) - base_keys
+            unique_text = " ".join(f"{key} {variant_resources[key]}" for key in unique).lower()
+            unique_keys_text = " ".join(unique).lower()
+            query_signals = set(variant.get("lexical_matches") or []) | set(variant.get("exact_identifier_matches") or [])
+            unique_relevant = any(signal and signal.lower() in unique_keys_text for signal in query_signals)
+            unique_security = any(marker in unique_keys_text for marker in SECURITY_RESOURCE_MARKERS)
+            if not unique_relevant and not unique_security:
+                removed.add(variant["chunk_id"])
+    return [item for item in chunks if item["chunk_id"] not in removed], sorted(removed)
+
+
 JAVA_MAPPING_PATTERN = re.compile(
     r'@(RequestMapping|GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping)\s*(?:\((?P<args>[^)]*)\))?',
     re.IGNORECASE | re.DOTALL,
@@ -1192,7 +1763,39 @@ ENUMERATION_TERMS = (
 
 def _has_enumeration_intent(query: str) -> bool:
     lowered = query.lower()
-    return any(term in lowered for term in ENUMERATION_TERMS)
+    if any(term in lowered for term in ENUMERATION_TERMS):
+        return True
+    if _has_manifest_component_enumeration_intent(query):
+        return True
+    if not re.search(r"\bwhich\b", lowered):
+        return False
+    plural_category = bool(re.search(
+        r"\bwhich\s+(?:[a-z0-9_-]+\s+){0,3}(?:writes|mutations|operations|actions|fields|endpoints|updates|changes|edits)\b",
+        lowered,
+    ))
+    distributive_evidence = bool(re.search(
+        r"\beach\s+(?:restriction|operation|write|blocked\s+action)\b",
+        lowered,
+    ))
+    broad_category = bool(re.search(r"\b(?:writes|mutations|operations|actions|fields|endpoints|updates|changes|edits)\b", lowered))
+    return plural_category or (distributive_evidence and broad_category)
+
+
+def _has_manifest_component_enumeration_intent(query: str) -> bool:
+    if not has_manifest_component_intent(query):
+        return False
+    lowered = query.lower()
+    plural_family = bool(re.search(
+        r"\b(?:components|activities|services|receivers|broadcast\s+receivers|providers|"
+        r"content\s+providers|activity\s+aliases)\b",
+        lowered,
+    ))
+    explicit_list = bool(re.search(r"\b(?:list|enumerate|all|every|each)\b", lowered))
+    bounded_question = bool(re.search(r"^\s*which\b", lowered)) or bool(re.search(
+        r"^\s*what\s+(?:android\s+|manifest\s+)?components\b.*\b(?:are|can|have|require)",
+        lowered,
+    ))
+    return plural_family and (explicit_list or bounded_question)
 
 
 def _selected_chunk_relevant(row: dict, enumeration_intent: bool) -> bool:

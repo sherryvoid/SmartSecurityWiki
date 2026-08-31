@@ -3,6 +3,13 @@
 .env.*
 !.env.example
 !backend/.env.example
+*.credentials.json
+*credentials*.json
+*secret*.json
+*.p12
+*.pfx
+*.jks
+*.keystore
 *.pem
 *.key
 credentials.json
@@ -18,6 +25,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
 .coverage
 coverage.xml
 htmlcov/
@@ -51,10 +59,13 @@ blob-report/
 coverage/
 frontend/e2e/screenshots/
 frontend/e2e/videos/
+frontend/e2e/traces/
 
 # Runtime application state
 storage/
 backend/storage/
+output/
+exports/
 *.db
 *.db-shm
 *.db-wal
@@ -79,11 +90,9 @@ Thumbs.db
 desktop.ini
 
 # Local research, diagnostics, and generated reports
-CurrentStatus*.md
-CURRENT_PROJECT_REPORT*.md
-FullProjectDirectoryAndSizeAudit.md
-docs/research/
-answer2.md
-answers.md
+# README.md is the repository's only committed Markdown document.
+docs/
+**/*.md
+!/README.md
 audit-report-*.html
 *audit-report-*.html

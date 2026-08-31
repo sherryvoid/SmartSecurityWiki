@@ -1,0 +1,12 @@
+policy version 1
+
+function ownsWorkspace() {
+  return workspace.ownerId == request.userId
+}
+
+function belongsToWorkspace() {
+  return request.userId in workspace.memberIds
+}
+
+allow read, write: if ownsWorkspace() || belongsToWorkspace()
+allow delete: if ownsWorkspace()

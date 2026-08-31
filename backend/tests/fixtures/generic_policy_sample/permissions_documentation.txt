@@ -1,0 +1,3 @@
+Owners can create, read, update, and delete records.
+Members have read permission according to the product documentation.
+This paragraph describes expected access but is not an enforcement policy.

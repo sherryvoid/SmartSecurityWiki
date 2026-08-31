@@ -69,9 +69,14 @@ def normalize_usage(provider: str, raw: dict | None) -> dict:
         thought_tokens = value("thoughtsTokenCount", "thoughts_token_count")
         available = any(v is not None for v in (input_tokens, output_tokens, total_tokens, cached_tokens, thought_tokens))
         return {"provider_reported_input_tokens": input_tokens, "provider_reported_output_tokens": output_tokens, "provider_reported_total_tokens": total_tokens, "provider_reported_cached_input_tokens": cached_tokens, "provider_reported_reasoning_tokens": thought_tokens, "provider_reported_thinking_tokens": thought_tokens, "usage_source": "provider_reported" if available else "unavailable", "load_duration_ms": None, "prompt_eval_duration_ms": None, "generation_duration_ms": None, "native_usage": raw}
-    if provider == "openai":
+    if provider in {"openai", "openrouter"}:
         prompt_details, output_details = raw.get("prompt_tokens_details") or raw.get("input_tokens_details") or {}, raw.get("completion_tokens_details") or raw.get("output_tokens_details") or {}
-        return {"provider_reported_input_tokens": raw.get("prompt_tokens", raw.get("input_tokens")), "provider_reported_output_tokens": raw.get("completion_tokens", raw.get("output_tokens")), "provider_reported_total_tokens": raw.get("total_tokens"), "provider_reported_cached_input_tokens": prompt_details.get("cached_tokens"), "provider_reported_reasoning_tokens": output_details.get("reasoning_tokens"), "provider_reported_thinking_tokens": None, "usage_source": "provider_reported" if raw else "unavailable", "load_duration_ms": None, "prompt_eval_duration_ms": None, "generation_duration_ms": None, "native_usage": raw}
+        reported_cost = raw.get("cost") if provider == "openrouter" else None
+        try:
+            reported_cost = float(reported_cost) if reported_cost is not None else None
+        except (TypeError, ValueError):
+            reported_cost = None
+        return {"provider_reported_input_tokens": raw.get("prompt_tokens", raw.get("input_tokens")), "provider_reported_output_tokens": raw.get("completion_tokens", raw.get("output_tokens")), "provider_reported_total_tokens": raw.get("total_tokens"), "provider_reported_cached_input_tokens": prompt_details.get("cached_tokens"), "provider_reported_reasoning_tokens": output_details.get("reasoning_tokens"), "provider_reported_thinking_tokens": None, "provider_reported_cost": reported_cost, "usage_source": "provider_reported" if raw else "unavailable", "load_duration_ms": None, "prompt_eval_duration_ms": None, "generation_duration_ms": None, "native_usage": raw}
     if provider == "groq":
         prompt_details = raw.get("prompt_tokens_details") or {}
         completion_details = raw.get("completion_tokens_details") or {}
@@ -102,6 +107,8 @@ def active_scenario_pricing(connection) -> dict | None:
 
 def persist_usage(*, execution_id: str, run_id: str, project_id: str, operation: str, provider: str, model: str, normalized: dict, duration_ms: int, composition: dict, supplied_source: list[dict], cited_source: list[dict], wiki: list[dict], source_hash: str, wiki_hash: str, status: str, warnings: list[dict] | None = None, run_purpose: str = "development", model_configuration: dict | None = None) -> dict:
     api_cost, pricing_revision = (0.0, "ollama-local-v1") if provider == "ollama" else (None, None)
+    if provider == "openrouter" and normalized.get("provider_reported_cost") is not None:
+        api_cost, pricing_revision = normalized["provider_reported_cost"], "openrouter-provider-reported"
     with db() as connection:
         if model_configuration is None:
             settings = get_settings()
@@ -110,9 +117,13 @@ def persist_usage(*, execution_id: str, run_id: str, project_id: str, operation:
             model_configuration = {"provider":provider,"exact_model_tag":model,"digest":runtime["digest"] if runtime else None,"quantization":native.get("quantization"),"reasoning":("enabled" if settings.ollama_think_enabled else "disabled") if provider=="ollama" else None,"num_ctx":settings.ollama_context_length if provider=="ollama" else None,"num_predict":settings.ollama_num_predict if provider=="ollama" else None,"temperature":0.1,"timeout_seconds":getattr(settings,f"{provider}_timeout_seconds",None),"serialization_version":settings.prompt_serialization_version}
             if provider == "groq":
                 model_configuration.update({"reasoning_effort":settings.groq_reasoning_effort or "provider_default","reasoning_format":settings.groq_reasoning_format,"include_reasoning":settings.groq_include_reasoning,"temperature":"provider_default","max_output_tokens":settings.groq_max_output_tokens,"base_url":settings.groq_base_url})
+            if provider == "openrouter":
+                model_configuration.update({"deployment_route":f"{settings.openrouter_model} accessed through OpenRouter","max_output_tokens":settings.openrouter_max_output_tokens,"base_url":settings.openrouter_base_url})
+                if model.lower() in {"openai/gpt-5.1", "gpt-5.1"}:
+                    model_configuration["presentation_prompt_version"] = settings.gpt51_presentation_version
         scenario = active_scenario_pricing(connection)
         actual_pricing = connection.execute("SELECT * FROM model_pricing WHERE provider=? AND model=? ORDER BY effective_from DESC,created_at DESC LIMIT 1", (provider, model)).fetchone()
-        if actual_pricing:
+        if actual_pricing and api_cost is None:
             api_cost = calculate_token_cost(normalized.get("provider_reported_input_tokens"), normalized.get("provider_reported_output_tokens"), input_price=actual_pricing["input_price_per_million"], cached_input_price=actual_pricing["cached_input_price_per_million"], output_price=actual_pricing["output_price_per_million"], cached_tokens=normalized.get("provider_reported_cached_input_tokens"))
             pricing_revision = actual_pricing["pricing_revision"]
         if provider == "openai" and scenario and model == scenario["model"]:
@@ -136,6 +147,14 @@ def usage_summary(project_id: str | None = None) -> dict:
         row["cited_source_chunk_ids"] = json.loads(row.pop("cited_source_chunk_ids_json") or "[]")
         row["supplied_wiki_chunk_ids"] = json.loads(row.pop("supplied_wiki_chunk_ids_json") or "[]")
         row["safe_native_usage"] = json.loads(row.pop("native_usage_json") or "{}")
+        if row.get("provider") == "openrouter" and row.get("api_cost") is None:
+            reported_cost = row["safe_native_usage"].get("cost")
+            try:
+                row["api_cost"] = float(reported_cost) if reported_cost is not None else None
+            except (TypeError, ValueError):
+                row["api_cost"] = None
+            if row["api_cost"] is not None:
+                row["pricing_revision"] = row.get("pricing_revision") or "openrouter-provider-reported"
         row["warnings"] = json.loads(row.pop("warnings_json") or "[]")
         row["model_configuration"] = json.loads(row.pop("model_configuration_json") or "{}")
         row["gpt_equivalent_estimate"] = calculate_token_cost(row.get("provider_reported_input_tokens"), row.get("provider_reported_output_tokens"), input_price=pricing["uncached_input_price_per_million"], output_price=pricing["output_price_per_million"]) if pricing else None

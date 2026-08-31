@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from app.core.config import get_settings
 from app.db.database import db
 from app.db.schemas import ChatAnswer, ChatRequest, CompareRequest, DISPLAY_STATUS_MAP, EvaluationScoreRequest, SecurityWikiSchema, VerificationRequest, WikiGenerateRequest, display_status_for
-from app.services.llm import active_provider_names, generate_structured_security_wiki_diagnostic, is_provider_available, provider_for, sanitize_diagnostic_text, security_wiki_system_prompt
+from app.services.llm import active_provider_names, context_incompatible_response, generate_structured_security_wiki_diagnostic, is_provider_available, prompt_fit_preflight, provider_for, sanitize_diagnostic_text, security_wiki_system_prompt
 from app.services.methodology import evaluation_configuration, freeze_wiki_context, persist_formal_run, render_structured_answer_payload, validate_model_references
 from app.services.project_service import compact_evidence_to_prompt, evidence_to_prompt, now, repository_existence_to_prompt, retrieve_evidence, retrieve_evidence_package, retrieve_wiki_context
 from app.services.vector_index import code_chunk_exists, delete_wiki_page_vectors, index_wiki_page
@@ -25,6 +25,14 @@ from app.services.usage_service import measure_prompt_components, normalize_usag
 logger = logging.getLogger(__name__)
 
 EVIDENCE_DISCLAIMER = "Generated Security Wiki content is used as orientation. Source-code and configuration chunks are the primary evidence."
+
+
+def _selected_provider_available(provider: str, model: str) -> bool:
+    """Check an exact selection while remaining compatible with simple test doubles."""
+    try:
+        return is_provider_available(provider, model)
+    except TypeError:
+        return is_provider_available(provider)
 
 
 SYSTEM_PROMPT = """You are a security audit assistant.
@@ -65,6 +73,20 @@ Return only valid JSON with this shape:
   "needs_review": true
 }
 """
+
+GPT51_CONCISE_PRESENTATION_PROMPT = """GPT-5.1 presentation configuration: gpt51-concise-v1.
+Answer completely but concisely. Prefer a compact evidence-grounded explanation and normally finish well below the output-token ceiling once the answer is complete.
+Do not repeat the same fact in multiple fields or sections. Do not reproduce long source-code blocks unless exact syntax is security-relevant or the question asks for exact code; summarize code in prose while retaining important identifiers, authorities, routes, method names, line ranges, and evidence references.
+For vertical traces, state one compact repository execution chain (for example controller -> authorization -> service -> downstream implementation), then explain only material details. For enumeration questions, prefer one compact table or bullet matrix and do not repeat it in prose.
+Keep access_control_summary to 1-3 sentences and do not restate the full answer. helper_chain must contain only actual repository implementation/helper relationships, never analysis steps such as parsing, inspecting, cross-referencing, or evaluating. Limit limitations to material evidence gaps that affect the conclusion; omit generic speculative caveats when supplied evidence proves the point.
+Preserve the required JSON schema and every technically important, source-supported fact. Do not change grounding, confidence, evidence_refs, or needs_review rules."""
+
+
+def presentation_configuration(provider: str | None, model: str | None) -> dict:
+    """Identify the answer-style contract without changing generation parameters."""
+    if (provider or "").lower() == "openrouter" and (model or "").lower() in {"openai/gpt-5.1", "gpt-5.1"}:
+        return {"presentation_prompt_version": get_settings().gpt51_presentation_version}
+    return {}
 
 SIMPLE_PROMPT_TEMPLATE = """You are a security code auditor.
 Answer using ONLY the source code evidence below.
@@ -413,18 +435,19 @@ async def chat(project_id: str, request: ChatRequest) -> dict:
         validation_status = "no_evidence"
         response_evidence = []
     else:
-        messages = _chat_messages_for_provider(provider, request.question, evidence, wiki_context, existence_searches)
+        messages = _chat_messages_for_provider(provider, request.question, evidence, wiki_context, existence_searches, model=model)
         prompt_composition = measure_prompt_components(messages, request.question, evidence, wiki_context, wiki_context_to_prompt)
-        result = await safe_generate(
-            provider,
-            messages,
-            model,
-        )
+        result = await safe_generate(provider, messages, model)
         raw_model_response = result.get("content") or ""
         if _is_timeout_result(result):
             content = "Model did not respond within the time limit."
             validation_status = "timeout"
             parsed_answer_json = None
+            response_evidence = []
+        elif result.get("ok") is False:
+            content = result.get("error", {}).get("user_message") or "The model provider could not evaluate this request."
+            parsed_answer_json = None
+            validation_status = result.get("validation_status") or "provider_unavailable"
             response_evidence = []
         elif getattr(provider, "name", "").lower() == "ollama":
             content = result.get("content") or raw_model_response
@@ -435,6 +458,7 @@ async def chat(project_id: str, request: ChatRequest) -> dict:
             response_evidence = evidence
         else:
             parsed, validation_status, invalid_refs = parse_chat_answer(raw_model_response, evidence, existence_searches)
+            _record_chat_parse_outcome(result, validation_status, bool(raw_model_response))
             if parsed:
                 limitations = list(parsed.limitations)
                 if invalid_refs:
@@ -450,6 +474,8 @@ async def chat(project_id: str, request: ChatRequest) -> dict:
                 content = raw_model_response or "Not verified from the available source-code evidence."
                 parsed_answer_json = None
                 response_evidence = evidence
+                if validation_status == "text_fallback":
+                    validation_status = "completed_with_warnings"
     with db() as connection:
         connection.execute(
             """
@@ -461,7 +487,13 @@ async def chat(project_id: str, request: ChatRequest) -> dict:
         )
     reference_validation = validate_model_references(content, evidence, existence_searches)
     config_snapshot = evaluation_configuration(project_id, [{"provider": request.provider, "model": model}])
-    run_id = persist_formal_run({"run_id": execution_id, "project_id": project_id, "operation": "ask", "question": request.question, "provider_model": {"provider": request.provider, "model": model}, "answer": content, "primary_evidence": response_evidence, "supplied_source_evidence": evidence, "cited_source_evidence": response_evidence, "wiki_context": wiki_context, "execution_status": validation_status, "evaluation_config_hash": config_snapshot["evaluation_config_hash"], "evaluation_config": config_snapshot["evaluation_config"], "supplied_source_package_hash": supplied_package["shared_evidence_hash"], "supplied_wiki_package_hash": supplied_wiki_package["shared_wiki_context_hash"]})
+    evaluation_id = str(uuid.uuid4())
+    completed_at = now()
+    with db() as connection:
+        connection.execute("""INSERT INTO evaluations
+            (id,project_id,module_path,question,chat_message_id,model_provider,model_name,answer_text,parsed_answer_json,evidence_json,wiki_context_json,validation_status,evaluation_config_hash,evaluation_type,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (evaluation_id,project_id,request.module_id,request.question,answer_id,request.provider,model,content,parsed_answer_json,json.dumps(response_evidence),json.dumps(wiki_context),validation_status,config_snapshot["evaluation_config_hash"],"model",completed_at))
+    run_id = persist_formal_run({"run_id": execution_id, "project_id": project_id, "operation": "ask", "question": request.question, "provider_model": {"provider": request.provider, "model": model}, "answer": content, "primary_evidence": response_evidence, "supplied_source_evidence": evidence, "cited_source_evidence": response_evidence, "wiki_context": wiki_context, "execution_status": validation_status, "evaluation_config_hash": config_snapshot["evaluation_config_hash"], "evaluation_config": config_snapshot["evaluation_config"], "supplied_source_package_hash": supplied_package["shared_evidence_hash"], "supplied_wiki_package_hash": supplied_wiki_package["shared_wiki_context_hash"], "human_evaluation_id": evaluation_id, "started_at": started_at, "completed_at": completed_at})
     usage = persist_usage(execution_id=execution_id, run_id=run_id, project_id=project_id, operation="ask", provider=request.provider, model=model, normalized=normalize_usage(request.provider, result.get("usage") if evidence else {}), duration_ms=int((time.perf_counter() - started_perf) * 1000), composition=prompt_composition if evidence else {}, supplied_source=evidence, cited_source=response_evidence, wiki=wiki_context, source_hash=supplied_package["shared_evidence_hash"], wiki_hash=supplied_wiki_package["shared_wiki_context_hash"], status=validation_status, warnings=reference_validation["model_reference_warnings"])
     execution = _execution_details(
         execution_id, started_at, "ask", validation_status, request.question,
@@ -475,6 +507,7 @@ async def chat(project_id: str, request: ChatRequest) -> dict:
     return {
         "session_id": session_id,
         "message_id": answer_id,
+        "evaluation_id": evaluation_id,
         "answer": content,
         "evidence": response_evidence,
         "supplied_source_evidence": evidence,
@@ -505,11 +538,9 @@ def parse_chat_answer(raw_content: str, evidence: list[dict], existence_searches
     valid_ids = {item["chunk_id"] for item in evidence}
     aliases = {f"E{index}": item["chunk_id"] for index, item in enumerate(evidence, 1)}
     existence_aliases = {f"X{index}" for index in range(1, len(existence_searches) + 1)}
-    try:
-        payload = json.loads(_extract_json_object(raw_content))
-        parsed = ChatAnswer.model_validate(payload)
-    except (json.JSONDecodeError, ValidationError, ValueError):
-        return None, "invalid_json_fallback", []
+    parsed = next(_validated_chat_answer_candidates(raw_content), None)
+    if parsed is None:
+        return None, "text_fallback" if raw_content.strip() else "empty_response", []
     parsed.evidence_refs = [aliases.get(ref.upper(), ref.upper() if ref.upper() in existence_aliases else ref) for ref in parsed.evidence_refs]
     invalid_refs = [ref for ref in parsed.evidence_refs if ref not in valid_ids and ref not in existence_aliases]
     if invalid_refs:
@@ -518,17 +549,54 @@ def parse_chat_answer(raw_content: str, evidence: list[dict], existence_searches
     return parsed, "valid_json", []
 
 
-def _extract_json_object(raw_content: str) -> str:
+def _validated_chat_answer_candidates(raw_content: str):
+    """Yield only complete JSON objects that satisfy the ChatAnswer contract."""
+    decoder = json.JSONDecoder()
+    seen = set()
     stripped = raw_content.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        if stripped.lower().startswith("json"):
-            stripped = stripped[4:].strip()
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("No JSON object found")
-    return stripped[start : end + 1]
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.IGNORECASE | re.DOTALL)
+    strict_text = fenced.group(1) if fenced else stripped
+    candidates = []
+    try:
+        strict_payload = json.loads(strict_text)
+        candidates.append(strict_payload)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    for index, char in enumerate(raw_content):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(raw_content, index)
+        except json.JSONDecodeError:
+            continue
+        candidates.append(payload)
+    for payload in candidates:
+        if not isinstance(payload, dict):
+            continue
+        fingerprint = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        try:
+            yield ChatAnswer.model_validate(payload)
+        except ValidationError:
+            continue
+
+
+def _record_chat_parse_outcome(result: dict, validation_status: str, content_present: bool) -> None:
+    """Make provider-success parser diagnostics terminal without changing provider text."""
+    diagnostics = result.setdefault("diagnostics", {})
+    processing = diagnostics.setdefault("processing", {})
+    processing["response_received"] = True
+    processing["content_present"] = content_present
+    processing["parse_status"] = validation_status
+    if validation_status in {"valid_json", "valid_with_dropped_invalid_evidence_refs"}:
+        processing["schema_validation_status"] = "valid"
+    elif validation_status == "text_fallback":
+        processing["schema_validation_status"] = "failed_text_preserved"
+    else:
+        processing["schema_validation_status"] = "not_applicable"
+    processing["evidence_validation_status"] = "backend_validation_completed" if content_present else "not_run_no_content"
 
 
 def _evidence_for_refs(evidence: list[dict], refs: list[str]) -> list[dict]:
@@ -543,7 +611,7 @@ def _uses_simple_prompt(provider) -> bool:
     return getattr(provider, "name", "").lower() == "ollama"
 
 
-def _chat_messages_for_provider(provider, question: str, evidence: list[dict], wiki_context: list[dict], existence_searches: list[dict] | None = None) -> list[dict]:
+def _chat_messages_for_provider(provider, question: str, evidence: list[dict], wiki_context: list[dict], existence_searches: list[dict] | None = None, model: str | None = None) -> list[dict]:
     existence_blocks = repository_existence_to_prompt(existence_searches or [])
     if _uses_simple_prompt(provider):
         existence_section = f"\n\nREPOSITORY-WIDE EXISTENCE METADATA (system-generated search results; not source-code blocks):\n{existence_blocks}" if existence_blocks else ""
@@ -567,8 +635,11 @@ def _chat_messages_for_provider(provider, question: str, evidence: list[dict], w
     else:
         source_and_context += "B. Generated wiki context. Use this only for orientation, not as proof:\n"
     source_and_context += wiki_context_to_prompt(wiki_context)
+    system_prompt = CHAT_JSON_PROMPT
+    if presentation_configuration(getattr(provider, "name", None), model):
+        system_prompt += "\n\n" + GPT51_CONCISE_PRESENTATION_PROMPT
     return [
-        {"role": "system", "content": CHAT_JSON_PROMPT},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": source_and_context,
@@ -622,19 +693,22 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
     shared_wiki_package = freeze_wiki_context(wiki_context)
     selected_provider_names = list(dict.fromkeys(request.providers))
     provider_name_for = lambda selection: selection.split("::", 1)[0]
-    unavailable_provider_names = [selection for selection in selected_provider_names if not is_provider_available(provider_name_for(selection))]
-    excluded_providers = [{**{"provider": provider_name_for(selection), "reason": "Provider is unavailable or not configured."}, **({"selection_id": selection} if "::" in selection else {})} for selection in unavailable_provider_names]
+    unavailable_provider_names = []
+    excluded_providers = []
     results = []
     selected_models = []
     for provider_selection in selected_provider_names:
         provider_name = provider_name_for(provider_selection)
         provider_execution_id = str(uuid.uuid4())
         provider_active = provider_name in active_provider_names()
-        provider, default_model = provider_for(provider_name if provider_active else "ollama")
+        provider, default_model = provider_for(provider_name) if provider_active else (None, provider_name)
         selection_model = provider_selection.split("::", 1)[1] if "::" in provider_selection else None
         model_override = selection_model or ((request.provider_models or {}).get(provider_name) if request.provider_models else None)
         model = model_override or (default_model if provider_active else provider_name)
         selected_models.append({"provider": provider_name, "model": model})
+        if not provider_active or not _selected_provider_available(provider_name, model):
+            unavailable_provider_names.append(provider_selection)
+            excluded_providers.append({**{"provider": provider_name, "reason": "Provider is unavailable or not configured."}, **({"selection_id": provider_selection} if "::" in provider_selection else {})})
         started = time.perf_counter()
 
         provider_evidence = evidence
@@ -644,8 +718,8 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
         prompt_composition = {}
         if provider_selection in unavailable_provider_names:
             result = {"content": "", "ok": False, "validation_status": "provider_unavailable", "diagnostics": {}, "error": {"error_code": "MODEL_NOT_CONFIGURED", "user_message": f"{provider_name.title()} is unavailable because it is not configured.", "technical_message": None, "retryable": False, "provider": provider_name, "model": model, "execution_id": compare_execution_id}}
-        elif provider_evidence and evidence_match:
-            messages = _chat_messages_for_provider(provider, request.question, provider_evidence, wiki_context, existence_searches)
+        elif provider_evidence and evidence_match and provider is not None:
+            messages = _chat_messages_for_provider(provider, request.question, provider_evidence, wiki_context, existence_searches, model=model)
             prompt_composition = measure_prompt_components(messages, request.question, provider_evidence, wiki_context, wiki_context_to_prompt)
             result = await safe_generate(provider, messages, model)
         elif provider_evidence:
@@ -682,6 +756,7 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
                 validation_status = result.get("validation_status", "valid_simple")
             else:
                 parsed, validation_status, invalid_refs = parse_chat_answer(raw_answer, provider_evidence, existence_searches)
+                _record_chat_parse_outcome(result, validation_status, bool(raw_answer))
                 if parsed:
                     limitations = list(parsed.limitations)
                     if invalid_refs:
@@ -696,6 +771,8 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
                 else:
                     answer = raw_answer
                     parsed_answer_json = None
+                    if validation_status == "text_fallback":
+                        validation_status = "completed_with_warnings"
         else:
             answer = "Not verified from the available source-code evidence."
             parsed_answer_json = None
@@ -709,9 +786,11 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
                 cited_evidence = [] if existence_refs and not refs else (_evidence_for_refs(provider_evidence, refs) if refs else provider_evidence)
             except (TypeError, json.JSONDecodeError):
                 cited_evidence = provider_evidence
+        prompt_fit = result.get("diagnostics", {}).get("prompt_fit", {"applicable": False, "passed": True, "provider": provider_name, "model": model, "count_type": "provider_capacity_not_configured"})
+        effective_context_valid = bool(prompt_fit.get("passed"))
         reference_validation = validate_model_references(answer, provider_evidence, existence_searches)
         route_warnings = (_unsupported_route_claims(answer, provider_evidence) if provider_evidence else []) + reference_validation["model_reference_warnings"]
-        if route_warnings and validation_status not in {"completed_with_evidence_mismatch", "timeout", "no_evidence"}:
+        if route_warnings and validation_status not in {"completed_with_evidence_mismatch", "timeout", "no_evidence", "provider_context_incompatible", "context_limit_exceeded"}:
             validation_status = "completed_with_warnings"
         if provider_evidence and not evidence_match:
             validation_status = "completed_with_evidence_mismatch"
@@ -783,6 +862,8 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
                 "supplied_evidence_categories": ["source_code", *(["repository_existence_metadata"] if existence_searches else []), *(["wiki_orientation"] if wiki_context else [])],
                 "usage": usage,
                 "evidence_package_match": evidence_match,
+                "effective_context_valid": effective_context_valid,
+                "prompt_fit_validation": prompt_fit,
                 "warnings": route_warnings,
                 **reference_validation,
                 **shared_wiki_package,
@@ -790,15 +871,16 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
                 "error": result.get("error"),
             }
         )
-    completed = [item for item in results if item["validation_status"] not in {"timeout", "no_evidence", "error", "provider_unavailable"}]
+    completed = [item for item in results if item["validation_status"] not in {"timeout", "no_evidence", "error", "provider_unavailable", "provider_context_incompatible", "context_limit_exceeded"}]
     source_match = bool(results) and all(item.get("supplied_source_chunk_ids") == shared_package["ordered_chunk_ids"] and item.get("supplied_source_package_hash") == shared_package["shared_evidence_hash"] for item in results)
     wiki_match = bool(results) and all(item.get("supplied_wiki_chunk_ids") == shared_wiki_package["ordered_wiki_chunk_ids"] and item.get("supplied_wiki_package_hash") == shared_wiki_package["shared_wiki_context_hash"] for item in results)
     config_snapshot = evaluation_configuration(project_id, selected_models)
     comparison_model_count = len(results)
     compatible_config = bool(config_snapshot.get("evaluation_config_hash"))
-    rq2_eligible = len(completed) >= 2 and source_match and wiki_match and compatible_config
-    invalid_reason = None if rq2_eligible else ("Single-model diagnostic run — not eligible for RQ2 comparison." if len(completed) == 1 else "Comparison is not methodologically valid because at least two models did not complete with identical source and Wiki packages.")
-    persist_formal_run({"run_id": compare_execution_id, "project_id": project_id, "operation": "compare", "question": request.question, "provider_model": selected_models, "answer": results, "primary_evidence": evidence, "supplied_source_evidence": evidence, "cited_source_evidence": [], "wiki_context": wiki_context, "execution_status": "completed" if results else "failed", "comparison_metadata": {**shared_package, **shared_wiki_package, "comparison_model_count": comparison_model_count, "completed_model_count": len(completed), "primary_evidence_match": source_match, "wiki_context_match": wiki_match, "comparison_valid": rq2_eligible, "rq2_comparison_eligible": rq2_eligible}, "evaluation_config_hash": config_snapshot["evaluation_config_hash"], "evaluation_config": config_snapshot["evaluation_config"], "supplied_source_package_hash": shared_package["shared_evidence_hash"], "supplied_wiki_package_hash": shared_wiki_package["shared_wiki_context_hash"]})
+    effective_context_valid = bool(results) and all(item.get("effective_context_valid", False) for item in results)
+    rq2_eligible = len(completed) >= 2 and source_match and wiki_match and compatible_config and effective_context_valid
+    invalid_reason = None if rq2_eligible else ("Comparison is not methodologically valid because at least one provider could not evaluate the complete prompt without truncation." if not effective_context_valid else ("Single-model diagnostic run — not eligible for RQ2 comparison." if len(completed) == 1 else "Comparison is not methodologically valid because at least two models did not complete with identical source and Wiki packages."))
+    persist_formal_run({"run_id": compare_execution_id, "project_id": project_id, "operation": "compare", "question": request.question, "provider_model": selected_models, "answer": results, "primary_evidence": evidence, "supplied_source_evidence": evidence, "cited_source_evidence": [], "wiki_context": wiki_context, "execution_status": "completed" if results else "failed", "comparison_metadata": {**shared_package, **shared_wiki_package, "comparison_model_count": comparison_model_count, "completed_model_count": len(completed), "primary_evidence_match": source_match, "wiki_context_match": wiki_match, "effective_context_valid": effective_context_valid, "comparison_valid": rq2_eligible, "rq2_comparison_eligible": rq2_eligible}, "evaluation_config_hash": config_snapshot["evaluation_config_hash"], "evaluation_config": config_snapshot["evaluation_config"], "supplied_source_package_hash": shared_package["shared_evidence_hash"], "supplied_wiki_package_hash": shared_wiki_package["shared_wiki_context_hash"], "started_at": compare_started_at, "completed_at": now()})
     return {
         "question": request.question, "evidence": evidence, "wiki_context": wiki_context, "results": results,
         "repository_existence_evidence": existence_searches,
@@ -807,6 +889,7 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
         "comparison_valid": rq2_eligible,
         "primary_evidence_match": source_match,
         "wiki_context_match": wiki_match,
+        "effective_context_valid": effective_context_valid,
         "comparison_invalid_reason": invalid_reason,
         "comparison_model_count": comparison_model_count, "completed_model_count": len(completed), "rq2_comparison_eligible": rq2_eligible,
         **shared_wiki_package, **config_snapshot,
@@ -818,6 +901,7 @@ async def compare_models(project_id: str, request: CompareRequest) -> dict:
             "shared_evidence_package_id": shared_package["shared_evidence_package_id"],
             "shared_evidence_hash": shared_package["shared_evidence_hash"],
             "comparison_valid": rq2_eligible,
+            "effective_context_valid": effective_context_valid,
             "comparison_invalid_reason": invalid_reason,
             "comparison_model_count": comparison_model_count, "completed_model_count": len(completed), "rq2_comparison_eligible": rq2_eligible,
             **shared_wiki_package, **config_snapshot,
@@ -881,12 +965,13 @@ def _execution_details(
         "valid_simple": "completed_with_warnings",
         "timeout": "provider_timeout",
         "invalid_json_fallback": "response_parse_failed",
+        "text_fallback": "completed_with_warnings",
         "no_evidence": "evidence_validation_failed",
         "no_source_evidence": "evidence_validation_failed",
         "error": "provider_unavailable",
     }.get(status, status)
     if normalized_status in {"completed", "completed_with_warnings"} or status.startswith("valid"):
-        processing_stage = {**processing_stage, "response_received": True, "content_present": processing_stage.get("content_present", True), "parse_status": status, "schema_validation_status": "valid" if status == "valid_json" else processing_stage.get("schema_validation_status", "not_required"), "evidence_validation_status": "valid"}
+        processing_stage = {**processing_stage, "response_received": True, "content_present": processing_stage.get("content_present", True), "parse_status": processing_stage.get("parse_status", status), "schema_validation_status": "valid" if status == "valid_json" else processing_stage.get("schema_validation_status", "not_required"), "evidence_validation_status": "valid"}
     return {
         "execution_id": execution_id,
         "started_at": started_at,
@@ -927,6 +1012,7 @@ def _execution_details(
             "source_chunks_sent": len(source_chunks), "source_chunk_count": len(source_chunks), "wiki_chunks_sent": len(wiki_chunks),
             "serialized_source_characters": len(compact_evidence_to_prompt(source_chunks)),
             "effective_model_configuration": _effective_model_configuration(provider, model, timeout),
+            "prompt_fit_validation": processing.get("prompt_fit") if isinstance(processing, dict) else None,
             "evidence_supplied_to_model": _serialized_evidence_metadata(source_chunks, retrieval.get("evidence_role_by_chunk_id", retrieval.get("evidence_role_by_chunk", {}))),
             "request_duration_ms": duration_ms, "http_status": None, "retry_count": 0,
             **diagnostic_envelope,
@@ -949,17 +1035,26 @@ def _execution_details(
 
 def _effective_model_configuration(provider: str, model: str, timeout) -> dict:
     settings = get_settings()
-    common = {"exact_model_tag": model, "timeout_seconds": timeout, "prompt_serialization_version": settings.prompt_serialization_version}
+    common = {"exact_model_tag": model, "timeout_seconds": timeout, "prompt_serialization_version": settings.prompt_serialization_version, **presentation_configuration(provider, model)}
     if provider == "ollama":
         return {**common, "reasoning": "enabled" if settings.ollama_think_enabled else "disabled", "temperature": 0.1, "top_p": None, "num_predict": settings.ollama_num_predict, "context_length": settings.ollama_context_length}
     if provider == "groq":
         return {**common, "reasoning_effort": settings.groq_reasoning_effort or "provider_default", "reasoning_format": settings.groq_reasoning_format, "include_reasoning": settings.groq_include_reasoning, "temperature": "provider_default", "max_output_tokens": settings.groq_max_output_tokens, "base_url": settings.groq_base_url}
+    if provider == "openrouter":
+        return {**common, "temperature": 0.1, "max_output_tokens": settings.openrouter_max_output_tokens, "base_url": settings.openrouter_base_url, "deployment_route": f"{settings.openrouter_model} accessed through OpenRouter"}
     return {**common, "temperature": 0.1}
 
 
 async def safe_generate(provider, messages: list[dict], model: str) -> dict:
+    preflight = prompt_fit_preflight(provider, messages, model)
+    if not preflight["passed"]:
+        return context_incompatible_response(preflight)
     try:
-        return await provider.generate(messages, model)
+        result = await provider.generate(messages, model)
+        diagnostics = dict(result.get("diagnostics") or {})
+        diagnostics["prompt_fit"] = preflight
+        result["diagnostics"] = diagnostics
+        return result
     except TimeoutError:
         return timeout_response()
     except Exception as exc:
@@ -1000,14 +1095,24 @@ def verify(request: VerificationRequest) -> dict:
     return {"id": verification_id, **request.model_dump(), "created_at": now()}
 
 
-def score_evaluation(evaluation_id: str, request: EvaluationScoreRequest) -> dict:
+def get_evaluation(project_id: str, evaluation_id: str) -> dict:
+    with db() as connection:
+        row = connection.execute("SELECT * FROM evaluations WHERE id=? AND project_id=?", (evaluation_id, project_id)).fetchone()
+    if not row:
+        raise ValueError("Evaluation not found")
+    return dict(row)
+
+
+def score_evaluation(evaluation_id: str, request: EvaluationScoreRequest, project_id: str | None = None) -> dict:
     payload = request.model_dump()
     if payload.get("evidence_discipline") is None and request.evidence_quality is not None:
         payload["evidence_discipline"] = request.evidence_quality
     notes = payload["notes"] if payload["notes"] is not None else payload["evaluator_comment"]
     hallucination = payload["hallucination"] if payload["hallucination"] is not None else payload["hallucination_flag"]
     with db() as connection:
-        existing = connection.execute("SELECT validation_status FROM evaluations WHERE id = ?", (evaluation_id,)).fetchone()
+        existing = connection.execute("SELECT validation_status FROM evaluations WHERE id = ? AND (? IS NULL OR project_id = ?)", (evaluation_id, project_id, project_id)).fetchone()
+        if not existing:
+            raise ValueError("Evaluation not found")
         if existing and existing["validation_status"] in {"completed_with_evidence_mismatch", "context_limit_exceeded", "provider_context_incompatible"}:
             return {"id": evaluation_id, "error": "Comparison is not methodologically valid because providers received different evidence.", "scoring_allowed": False}
         connection.execute(
@@ -1025,6 +1130,7 @@ def score_evaluation(evaluation_id: str, request: EvaluationScoreRequest) -> dic
                 usefulness = ?,
                 evaluator_comment = ?,
                 human_comment = ?
+                , evaluated_at = ?
             WHERE id = ?
             """,
             (
@@ -1040,6 +1146,7 @@ def score_evaluation(evaluation_id: str, request: EvaluationScoreRequest) -> dic
                 payload["usefulness"],
                 notes,
                 notes,
+                now(),
                 evaluation_id,
             ),
         )
@@ -1050,17 +1157,17 @@ def score_evaluation(evaluation_id: str, request: EvaluationScoreRequest) -> dic
 
 
 def export_project(project_id: str, export_format: str, auditor_name: str = "Unknown") -> tuple[str, str, str]:
-    data = _export_data(project_id)
-    data["auditor_name"] = auditor_name
-    project = data["project"]
+    from app.services.report_service import build_project_report, render_html, render_markdown, render_pdf
+    report = build_project_report(project_id, auditor_name)
+    project = report["project"]
     project_name = _safe_filename(project.get("name") or project_id)
-    if export_format == "json":
-        return "application/json", f"{project_name}_audit_report.json", json.dumps(data, indent=2)
-    if export_format == "csv":
-        return "text/csv", f"{project_name}_audit_report.csv", _comparison_csv_export(data)
-    if export_format in {"pdf", "html"}:
-        return "text/html; charset=utf-8", f"audit-{project_id}.html", _html_export(data)
-    return "text/markdown", f"{project_name}_audit_report.md", _markdown_export(data)
+    if export_format == "pdf":
+        return "application/pdf", f"{project_name}_evaluation_report.pdf", render_pdf(report)
+    if export_format == "html":
+        return "text/html; charset=utf-8", f"{project_name}_evaluation_report.html", render_html(report)
+    if export_format in {"md", "markdown"}:
+        return "text/markdown; charset=utf-8", f"{project_name}_evaluation_report.md", render_markdown(report)
+    raise ValueError("Export format must be pdf, html, or markdown")
 
 
 def _export_data(project_id: str) -> dict:

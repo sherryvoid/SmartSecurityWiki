@@ -57,3 +57,28 @@ test("Groq missing-key reason is visible and disabled", async ({ page }) => {
   await expect(page.getByText("GROQ_API_KEY not configured")).toBeVisible();
   expect(await page.getByRole("option", { name: /Groq.*unavailable/i }).evaluate((option: HTMLOptionElement) => option.disabled)).toBe(true);
 });
+
+test("zero-model mode keeps deterministic workspace available and blocks LLM execution", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("security_codewiki_token", "test"));
+  const unavailable = (model: string, reason: string) => ({ available: false, status: "Not configured", reason, default_model: model, available_models: [] });
+  await page.route("**/api/models/health", r => r.fulfill({ json: {
+    gemini: unavailable("gemini-2.5-flash", "GEMINI_API_KEY not set"),
+    openrouter: unavailable("openai/gpt-5.1", "OPENROUTER_API_KEY not set"),
+    openai: unavailable("gpt-4o-mini", "OPENAI_API_KEY not set"),
+    groq: unavailable("openai/gpt-oss-20b", "GROQ_API_KEY not configured"),
+    ollama: { ...unavailable("qwen3.5:9b", "Ollama local server not responding"), reachable: false, default_model_exists: false, base_url: "local" },
+    embedding: { provider: "hash", model: "test", semantic: false, fallback_used: true, label: "Development hash fallback" },
+  } }));
+  await page.route("**/api/projects/zero/status", r => r.fulfill({ json: { status: "indexed", project: { id: "zero", name: "Zero", source_type: "local", local_path: "repo", status: "indexed", created_at: "now", updated_at: "now" } } }));
+  for (const suffix of ["files/tree", "wiki", "formal-runs"]) await page.route(`**/api/projects/zero/${suffix}`, r => r.fulfill({ json: [] }));
+  await page.route("**/api/projects/zero/usage", r => r.fulfill({ json: { overview: { requests: 0 }, by_model: [], by_operation: [], recent_executions: [] } }));
+
+  await page.goto("/projects/zero");
+  await expect(page.getByRole("button", { name: "Discover", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await expect(page.getByText("No language model is currently available.")).toBeVisible();
+  await page.getByLabel("Question").fill("Where is access control enforced?");
+  await expect(page.getByRole("button", { name: "Run analysis" })).toBeDisabled();
+  await page.getByRole("button", { name: "Compare", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Compare models" })).toBeDisabled();
+});

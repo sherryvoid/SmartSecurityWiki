@@ -20,6 +20,7 @@ export type ModelsHealth = {
   openai: { api_key_configured: boolean; default_model_configured: boolean; default_model: string; available: boolean; reason: string; status: string };
   gemini: { api_key_configured: boolean; default_model_configured: boolean; default_model: string; available: boolean; reason: string; status: string };
   groq: { api_key_configured: boolean; default_model_configured: boolean; default_model: string; available_models: string[]; available: boolean; reachable: boolean; reason: string; status: string; default_model_exists?: boolean };
+  openrouter: { api_key_configured: boolean; default_model_configured: boolean; default_model: string; available: boolean; reason: string; status: string };
   embedding: { provider: string; model: string; semantic: boolean; fallback_used: boolean; warning?: string | null; label: string };
 };
 
@@ -71,7 +72,6 @@ export const api = {
   deleteProject: (id: string) => request<{ deleted: boolean; message: string }>(`/projects/${id}`, { method: "DELETE" }),
   createProject: (payload: unknown) => request<Project>("/projects", { method: "POST", body: JSON.stringify(payload) }),
   createZipProject: (form: FormData) => request<Project>("/projects/zip", { method: "POST", body: form }),
-  androidCaseStudies: () => request<Array<{ id: string; name: string; hint: string }>>("/projects/android-case-studies"),
   project: (id: string) => request<Project>(`/projects/${id}`),
   status: (id: string) => request<{ status: string; status_message: string; project: Project }>(`/projects/${id}/status`),
   fileTree: (id: string) => request(`/projects/${id}/files/tree`),
@@ -92,7 +92,7 @@ export const api = {
   deleteWikiPage: (id: string, wikiPageId: string) =>
     request<{ deleted: boolean; message: string }>(`/projects/${id}/wiki/${wikiPageId}`, { method: "DELETE" }),
   chat: (id: string, question: string, provider: string, model?: string, module_id?: string) =>
-    request<{ message_id: string; answer: string; evidence: unknown[]; wiki_context: unknown[]; context_used: string; validation_status: string; display_status?: string; provider: string; model: string; execution?: ExecutionDetails }>(`/projects/${id}/chat`, {
+    request<{ message_id: string; evaluation_id?: string; answer: string; evidence: unknown[]; wiki_context: unknown[]; context_used: string; validation_status: string; display_status?: string; provider: string; model: string; execution?: ExecutionDetails }>(`/projects/${id}/chat`, {
       method: "POST",
       body: JSON.stringify({ question, provider, model, module_id })
     }),
@@ -102,10 +102,11 @@ export const api = {
       body: JSON.stringify({ question, providers, module_id, provider_models })
     }),
   scoreEvaluation: (id: string, evaluationId: string, payload: unknown) =>
-    request(`/projects/${id}/evaluations/${evaluationId}`, {
+    request<Record<string, any>>(`/projects/${id}/evaluations/${evaluationId}`, {
       method: "PATCH",
       body: JSON.stringify(payload)
     }),
+  evaluation: (id: string, evaluationId: string) => request<Record<string, any>>(`/projects/${id}/evaluations/${evaluationId}`),
   verify: (id: string, target_type: string, target_id: string, verdict: string, human_comment?: string) =>
     request(`/projects/${id}/verify`, {
       method: "POST",
@@ -113,11 +114,11 @@ export const api = {
     })
 };
 
-export function exportUrl(projectId: string, format: "markdown" | "json" | "csv"): string {
+export function exportUrl(projectId: string, format: "markdown" | "html" | "pdf"): string {
   return `${API_BASE}/projects/${projectId}/export?format=${encodeURIComponent(format)}`;
 }
 
-export async function downloadExport(projectId: string, format: "markdown" | "json" | "csv"): Promise<void> {
+export async function downloadExport(projectId: string, format: "markdown" | "html" | "pdf"): Promise<void> {
   const token = getToken();
   const response = await fetch(exportUrl(projectId, format), {
     headers: token ? { Authorization: `Bearer ${token}` } : {}
@@ -133,7 +134,7 @@ export async function downloadExport(projectId: string, format: "markdown" | "js
   const blob = await response.blob();
   const disposition = response.headers.get("Content-Disposition") ?? "";
   const match = disposition.match(/filename=([^;]+)/);
-  const filename = match?.[1] ?? `security-codewiki.${format === "markdown" ? "md" : format}`;
+  const filename = match?.[1]?.replace(/^"|"$/g, "") ?? `security-codewiki.${format === "markdown" ? "md" : format}`;
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;

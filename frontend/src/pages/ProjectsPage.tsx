@@ -13,10 +13,8 @@ export default function ProjectsPage() {
   const [repoUrl, setRepoUrl] = useState("");
   const [subfolderPath, setSubfolderPath] = useState("");
   const [androidSourceUrl, setAndroidSourceUrl] = useState("");
-  const [androidCaseStudy, setAndroidCaseStudy] = useState("account-manager-service");
   const [securityGoal, setSecurityGoal] = useState("");
   const [zipFile, setZipFile] = useState<File | null>(null);
-  const [caseStudies, setCaseStudies] = useState<Array<{ id: string; name: string; hint: string }>>([]);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [deletingProjectId, setDeletingProjectId] = useState("");
@@ -24,7 +22,6 @@ export default function ProjectsPage() {
 
   useEffect(() => {
     api.projects().then(setProjects).catch(() => undefined);
-    api.androidCaseStudies().then(setCaseStudies).catch(() => undefined);
   }, []);
 
   async function submit(event: FormEvent) {
@@ -46,7 +43,6 @@ export default function ProjectsPage() {
           source_type: sourceType,
           repo_url: sourceType === "github" ? repoUrl : undefined,
           android_source_url: sourceType === "android" ? androidSourceUrl : undefined,
-          android_case_study: sourceType === "android" ? androidCaseStudy : undefined,
           subfolder_path: sourceType === "github" || sourceType === "android" ? subfolderPath : undefined,
           security_goal: securityGoal
         });
@@ -80,7 +76,7 @@ export default function ProjectsPage() {
       <section className="projects-content">
         <form className="new-project" onSubmit={submit}>
           <div className="card-heading"><h2>New project</h2><p>Import a repository or upload source code for analysis.</p></div>
-          <div className="info-callout"><Info/><span>For very large repositories such as Android AOSP, select a subfolder or curated case-study package. Full AOSP import is not supported in this prototype.</span></div>
+          <div className="info-callout"><Info/><span>For very large repositories such as Android AOSP, provide a subfolder to keep indexing focused. Full AOSP import is not supported in this prototype.</span></div>
           <label>
             Project name
             <input value={name} onChange={(event) => setName(event.target.value)} required />
@@ -111,18 +107,12 @@ export default function ProjectsPage() {
           {sourceType === "android" && (
             <div className="form-grid">
               <label>
-                Android Case Study
-                <select value={androidCaseStudy} onChange={(event) => setAndroidCaseStudy(event.target.value)}>
-                  {caseStudies.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-                </select>
-              </label>
-              <label>
                 Android Project Link
-                <input value={androidSourceUrl} onChange={(event) => setAndroidSourceUrl(event.target.value)} placeholder="GitHub URL or Android source package link" />
+                <input value={androidSourceUrl} onChange={(event) => setAndroidSourceUrl(event.target.value)} placeholder="Git-cloneable repository URL" required />
               </label>
               <label>
                 Optional Subfolder Path
-                <input value={subfolderPath} onChange={(event) => setSubfolderPath(event.target.value)} placeholder="services/core/java/com/android/server/accounts" />
+                <input value={subfolderPath} onChange={(event) => setSubfolderPath(event.target.value)} placeholder="Optional path inside the repository" />
               </label>
             </div>
           )}

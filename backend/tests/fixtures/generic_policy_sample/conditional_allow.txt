@@ -1,0 +1,10 @@
+policy version 1
+
+function signedCaller() {
+  return principal != null
+}
+
+allow create: if signedCaller()
+allow read: if signedCaller()
+allow update: if signedCaller()
+allow delete: if signedCaller()

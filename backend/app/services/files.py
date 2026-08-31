@@ -25,6 +25,7 @@ INCLUDE_EXTENSIONS = {
     ".rs",
     ".md",
     ".txt",
+    ".rules",
 }
 
 IGNORE_FOLDERS = {
@@ -80,6 +81,7 @@ def language_for_path(path: str) -> str:
         ".rs": "rust",
         ".md": "markdown",
         ".txt": "text",
+        ".rules": "text",
     }.get(suffix, "text")
 
 

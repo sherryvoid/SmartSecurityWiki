@@ -3,7 +3,6 @@
 import httpx
 
 from app.core.config import Settings, get_settings
-from app.services.llm import is_provider_available
 from app.services.vector_index import embedding_status
 
 
@@ -16,17 +15,17 @@ async def models_health(settings: Settings | None = None) -> dict:
         "openai": _cloud_health(settings.openai_api_key, settings.openai_default_model),
         "gemini": _cloud_health(settings.gemini_api_key, settings.resolved_gemini_default_model),
         "groq": groq,
+        "openrouter": _cloud_health(settings.openrouter_api_key, settings.openrouter_model, "OPENROUTER_API_KEY not set"),
         "embedding": embedding_status(),
     }
 
 
 async def _ollama_health(settings: Settings) -> dict:
-    available = is_provider_available("ollama")
     result = {
         "base_url": settings.ollama_base_url,
         "reachable": False,
-        "available": available,
-        "reason": "Local server responding" if available else "Ollama local server not responding",
+        "available": False,
+        "reason": "Ollama local server not responding",
         "available_models": [],
         "default_model": settings.ollama_default_model,
         "default_model_exists": False,
@@ -38,19 +37,21 @@ async def _ollama_health(settings: Settings) -> dict:
             response = await client.get(f"{settings.ollama_base_url}/api/tags")
             response.raise_for_status()
             data = response.json()
-    except httpx.HTTPError as exc:
-        result["detail"] = str(exc)
+    except httpx.HTTPError:
+        result["detail"] = "The configured Ollama endpoint could not be reached."
         return result
 
     models = [item.get("name", "") for item in data.get("models", []) if item.get("name")]
     result["reachable"] = True
     result["available_models"] = models
     result["default_model_exists"] = settings.ollama_default_model in models
+    result["available"] = result["default_model_exists"]
     result["status"] = "Ready" if result["default_model_exists"] else "Model not found"
+    result["reason"] = "Local model is installed and Ollama is responding." if result["default_model_exists"] else f"Configured model '{settings.ollama_default_model}' is not installed."
     return result
 
 
-def _cloud_health(api_key: str, default_model: str) -> dict:
+def _cloud_health(api_key: str, default_model: str, missing_reason: str | None = None) -> dict:
     api_key_configured = bool(api_key.strip())
     default_model_configured = bool(default_model.strip())
     if api_key_configured and default_model_configured:
@@ -64,7 +65,7 @@ def _cloud_health(api_key: str, default_model: str) -> dict:
         "default_model_configured": default_model_configured,
         "default_model": default_model,
         "available": api_key_configured,
-        "reason": "API key configured" if api_key_configured else _missing_key_reason(default_model),
+        "reason": "API key configured" if api_key_configured else missing_reason or _missing_key_reason(default_model),
         "status": status,
     }
 

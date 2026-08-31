@@ -1,7 +1,5 @@
 # READ SUMMARY: This test module verifies project export formats and manual evaluation scoring endpoints.
 # CHANGED: Added HTML audit report export coverage and seeded evaluation/wiki data for report assertions.
-import csv
-import io
 import json
 import shutil
 import uuid
@@ -103,33 +101,19 @@ def test_export_endpoint_returns_markdown_content_disposition(monkeypatch):
     response = client.get(f"/api/projects/{project_id}/export?format=markdown", headers=headers)
 
     assert response.status_code == 200
-    assert response.headers["content-disposition"].startswith('attachment; filename="Export_Demo_audit_report.md"')
-    assert "# Security Audit Report" in response.text
-    assert "## 1. Project Information" in response.text
-    assert "Generated Security Wiki content is used as orientation. Source-code and configuration chunks are the primary evidence." in response.text
+    assert response.headers["content-disposition"].startswith('attachment; filename="Export_Demo_evaluation_report.md"')
+    assert "# SecurityCodeWiki Evaluation Report" in response.text
+    assert "**Project:** Export Demo" in response.text
     shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def test_export_endpoint_returns_model_comparison_csv_headers(monkeypatch):
+def test_export_endpoint_rejects_removed_csv_format(monkeypatch):
     client, headers, temp_root = _client_and_headers(monkeypatch)
     project_id, _ = _seed_export_project()
 
     response = client.get(f"/api/projects/{project_id}/export?format=csv", headers=headers)
 
-    assert response.status_code == 200
-    rows = list(csv.reader(io.StringIO(response.text)))
-    assert rows[0] == [
-        "question_id",
-        "question_text",
-        "model_provider",
-        "model_name",
-        "evidence_count",
-        "answer_length_chars",
-        "human_correctness_score",
-        "human_evidence_quality_score",
-        "hallucination_flag",
-        "notes",
-    ]
+    assert response.status_code == 400
     shutil.rmtree(temp_root, ignore_errors=True)
 
 
@@ -166,7 +150,24 @@ def test_evaluation_scoring_rejects_out_of_range_correctness(monkeypatch):
     shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def test_export_html_structure(monkeypatch):
+def test_evaluation_save_reload_update_preserves_zero_and_hallucination_no(monkeypatch):
+    client, headers, temp_root = _client_and_headers(monkeypatch)
+    project_id, evaluation_id = _seed_export_project()
+    first = client.patch(f"/api/projects/{project_id}/evaluations/{evaluation_id}", headers=headers, json={"correctness": 0, "completeness": 0, "source_reference_accuracy": 0, "evidence_discipline": 0, "explanation_quality": 0, "usefulness": 0, "hallucination": False, "verdict": "Incomplete", "notes": "Zero scores are deliberate."})
+    assert first.status_code == 200
+    loaded = client.get(f"/api/projects/{project_id}/evaluations/{evaluation_id}", headers=headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["correctness_score"] == 0
+    assert loaded.json()["hallucination_flag"] == 0
+    assert loaded.json()["evaluator_comment"] == "Zero scores are deliberate."
+    updated = client.patch(f"/api/projects/{project_id}/evaluations/{evaluation_id}", headers=headers, json={"correctness": 3, "hallucination": False, "notes": "Updated."})
+    assert updated.json()["correctness_score"] == 3
+    assert updated.json()["evaluator_comment"] == "Updated."
+    assert client.get(f"/api/projects/wrong/evaluations/{evaluation_id}", headers=headers).status_code == 404
+    shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_export_pdf_is_real_pdf(monkeypatch):
     client, headers, temp_root = _client_and_headers(monkeypatch)
     project_id, _ = _seed_export_project()
 
@@ -174,10 +175,6 @@ def test_export_html_structure(monkeypatch):
 
     assert response.status_code == 200
     assert "attachment" in response.headers["content-disposition"]
-    assert "<html" in response.text
-    assert "Security Audit Report" in response.text
-    assert "Auditor Verification" in response.text
-    assert "Evaluation Scores" in response.text
-    assert "System Limitations" in response.text
-    assert "Generated Security Wiki content is used as orientation. Source-code and configuration chunks are the primary evidence." in response.text
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.content.startswith(b"%PDF-")
     shutil.rmtree(temp_root, ignore_errors=True)

@@ -63,6 +63,49 @@ def test_generic_repository_existence_search_reports_not_found_without_fake_evid
     assert all("not found" not in item["code_snippet"].lower() for item in package["source_chunks"])
 
 
+def test_multi_concept_existence_question_decomposes_independent_phrases():
+    from app.services.project_service import _extract_repository_existence_concepts
+
+    concepts = _extract_repository_existence_concepts("Does the repository implement logout, token revocation, or token storage?")
+    assert concepts == ["logout", "token revocation", "token storage"]
+    assert "logout, token revocation, or token storage" not in concepts
+
+
+def test_multiword_concepts_are_preserved_without_oversplitting():
+    from app.services.project_service import _extract_repository_existence_concepts
+
+    assert _extract_repository_existence_concepts("Are cookies and server-side sessions present?") == ["cookies", "server-side sessions"]
+    assert _extract_repository_existence_concepts("Does the repository implement role-based access control?") == ["role-based access control"]
+
+
+def test_android_style_existence_list_is_repository_independent():
+    from app.services.project_service import _extract_repository_existence_concepts
+
+    assert _extract_repository_existence_concepts("Are exported receivers, component permissions, or custom intent filters present?") == ["exported receivers", "component permissions", "custom intent filters"]
+
+
+def test_ordinary_coordination_without_existence_intent_does_not_trigger():
+    from app.services.project_service import _extract_repository_existence_concepts
+
+    assert _extract_repository_existence_concepts("Explain how authentication and authorization interact and/or differ in this flow.") == []
+
+
+def test_q9_style_clause_does_not_emit_adverbs_or_cross_sentence_fragments():
+    from app.services.project_service import _extract_repository_existence_concepts
+
+    question = "Is this application explicitly configured for stateless security/session handling? Identify the exact repository configuration. Explain whether SessionCreationPolicy.STATELESS, session-management configuration, cookies, server-side sessions, logout/revocation behavior, or token storage are actually present in source."
+    assert _extract_repository_existence_concepts(question) == ["SessionCreationPolicy.STATELESS", "session-management configuration", "cookies", "server-side sessions", "logout behavior", "revocation behavior", "token storage"]
+
+
+def test_mixed_positive_and_negative_requirements_keep_positive_roles():
+    from app.services.project_service import _extract_evidence_roles, _extract_repository_existence_concepts
+
+    question = "Identify the explicit authority configuration for protected access, and explain whether logout, token revocation, or token storage are present in source code."
+    concepts = _extract_repository_existence_concepts(question)
+    assert concepts == ["logout", "token revocation", "token storage"]
+    assert "needs_authority_checks" in _extract_evidence_roles(question)
+
+
 def test_non_existence_question_does_not_run_extra_repository_search(isolated_env, monkeypatch):
     from app.db.database import db, init_db
     from app.services import project_service

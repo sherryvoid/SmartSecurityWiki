@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     ollama_timeout_seconds: float = 60.0
     ollama_think_enabled: bool = False
     ollama_num_predict: int = 2048
-    ollama_context_length: int = 8192
+    ollama_context_length: int = 20480
 
     openai_api_key: str = ""
     openai_default_model: str = "gpt-4o-mini"
@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     groq_include_reasoning: bool = False
     groq_max_output_tokens: int = 2048
     groq_timeout_seconds: float = 120.0
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "openai/gpt-4o-mini"
+    openrouter_max_output_tokens: int = 2048
+    openrouter_timeout_seconds: float = 120.0
     cloud_llm_timeout_seconds: float = 120.0
     selected_file_min_chunks: int = 3
     selected_file_max_chunks: int = 5
@@ -49,6 +54,7 @@ class Settings(BaseSettings):
     evaluation_config_revision: str = "phase4.5-v1"
     prompt_version: str = "ask-v4.5"
     prompt_serialization_version: str = "compact-evidence-v1"
+    gpt51_presentation_version: str = "gpt51-concise-v1"
     wiki_prompt_version: str = "wiki-v4.5"
     diagnostic_raw_response_max_chars: int = 8000
 

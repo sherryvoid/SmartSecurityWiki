@@ -32,6 +32,7 @@ class ProjectResponse(BaseModel):
     repo_url: str | None
     local_path: str
     subfolder_path: str | None = None
+    android_case_study: str | None = None
     commit_hash: str | None
     status: str
     status_message: str | None
@@ -90,6 +91,7 @@ DISPLAY_STATUS_MAP = {
     "completed": "Completed",
     "completed_with_warnings": "Completed with warnings",
     "provider_unavailable": "Provider unavailable",
+    "provider_context_incompatible": "Provider context incompatible",
     "provider_timeout": "Provider timed out",
     "empty_response": "Empty response",
     "response_parse_failed": "Response parse failed",
